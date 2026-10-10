@@ -42,6 +42,11 @@ FRONTEND_CRITICAL_VITEST := \
 	src/views/admin/__tests__/RequestCaptureView.spec.ts \
 	src/stores/__tests__/adminSettings.retry.spec.ts \
 	src/i18n/__tests__/localeKeyCompleteness.spec.ts \
+	src/i18n/__tests__/localesMessageCompile.spec.ts \
+	src/components/account/__tests__/AccountTurnStateCell.spec.ts \
+	src/components/account/__tests__/AccountStatusIndicator.spec.ts \
+	src/components/account/__tests__/EditAccountModal.spec.ts \
+	src/components/common/__tests__/VersionBadge.spec.ts \
 	src/api/__tests__/client.spec.ts \
 	src/api/__tests__/keys.spec.ts \
 	src/api/__tests__/tokenRefresh.spec.ts \

@@ -190,12 +190,15 @@ func (s *AccountTestService) ProbeOpenAIAPIKeyResponsesSupport(ctx context.Conte
 	applyOpenAIAPIKeyIdentityHeaders(req.Header, account, account.GetOpenAIUserAgent())
 	account.ApplyHeaderOverrides(req.Header)
 
-	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
+	proxyURL, err := resolveConfiguredProxyURL(ctx, nil, account.ProxyID, account.Proxy)
+	if err != nil {
+		logger.LegacyPrintf("service.openai_probe", "probe_proxy_failed: account_id=%d err=%v", accountID, err)
+		return
 	}
 
-	resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
+	resp, err := s.recordOpenAIHTTP(account, req, func(req *http.Request) (*http.Response, error) {
+		return s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
+	})
 	if err != nil {
 		// 网络层失败：不写标记，保持 unknown，下次重试或由网关 fallback 处理
 		logger.LegacyPrintf("service.openai_probe", "probe_request_failed: account_id=%d url=%s err=%v", accountID, probeURL, err)

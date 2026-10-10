@@ -40,7 +40,9 @@ func observeAutoConfigRequest(c *gin.Context, ops *service.OpsService, w *opsCap
 	if id <= 0 || failed[id] || service.IsPrismBrowserAttempt(c, id) {
 		return
 	}
-	if c.Request.Context().Err() != nil || c.Writer.Status() == 499 {
+	// 正常结束时 handler 释放可续租并发槽会取消 c.Request 的 ctx（WithRenewableConcurrencySlots）；
+	// 那不是客户端断开，不能因此漏掉这次结果。
+	if ctx := c.Request.Context(); (ctx.Err() != nil && !service.IsConcurrencySlotReleaseCancellation(ctx)) || c.Writer.Status() == 499 {
 		return
 	}
 	state, _ := w.lockActive()

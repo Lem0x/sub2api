@@ -1020,21 +1020,32 @@ func (s *AccountTestService) buildOpenAIUpstreamModelsRequest(ctx context.Contex
 // buildOpenAIAPIKeyModelsRequest is shared by admin discovery and public model
 // listing. Codex content negotiation is intentionally absent from this request.
 func buildOpenAIAPIKeyModelsRequest(ctx context.Context, account *Account, validateBaseURL func(string) (string, error)) (*http.Request, error) {
-	if account.Type != AccountTypeAPIKey {
+	var apiKey, baseURL string
+	switch {
+	case account.IsCPR():
+		// CPR 有 GET /v1/models（openai/router.rs:25），形状与 API key 一路相同。
+		// 唯一差别：base_url 缺失必须报错，绝不回落 api.openai.com——那会把
+		// CPR 的 client key 当成 OpenAI API key 明文发出去。
+		apiKey = strings.TrimSpace(account.GetCPRClientKey())
+		baseURL = strings.TrimSpace(account.GetCPRGatewayBaseURL())
+		if baseURL == "" {
+			return nil, newUpstreamModelSyncConfigError("cpr account requires credentials.base_url", nil)
+		}
+	case account.Type == AccountTypeAPIKey:
+		apiKey = strings.TrimSpace(account.GetOpenAIProtocolAPIKey())
+		// 协议感知：Anthropic 协议账号的凭证 base_url 指向 /anthropic 端点，模型
+		// 列表同步需使用 OpenAI 格式 base（供应商 × 模式默认）。
+		baseURL = account.GetOpenAIFormatBaseURL()
+		if strings.TrimSpace(baseURL) == "" {
+			baseURL = "https://api.openai.com"
+		}
+	default:
 		return nil, newUpstreamModelSyncUnsupportedError(
 			fmt.Sprintf("Unsupported OpenAI account type for upstream model sync: %s", account.Type), nil,
 		)
 	}
-	apiKey := strings.TrimSpace(account.GetOpenAIProtocolAPIKey())
 	if apiKey == "" {
 		return nil, newUpstreamModelSyncConfigError("No OpenAI API key is available", nil)
-	}
-
-	// 协议感知：Anthropic 协议账号的凭证 base_url 指向 /anthropic 端点，模型
-	// 列表同步需使用 OpenAI 格式 base（供应商 × 模式默认）。
-	baseURL := account.GetOpenAIFormatBaseURL()
-	if strings.TrimSpace(baseURL) == "" {
-		baseURL = "https://api.openai.com"
 	}
 	normalizedBaseURL, err := validateBaseURL(baseURL)
 	if err != nil {
@@ -1047,6 +1058,10 @@ func buildOpenAIAPIKeyModelsRequest(ctx context.Context, account *Account, valid
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
+	// 不设 User-Agent 的话 net/http 会填 Go-http-client/1.1 出站。这条对 cpr 打的是本机
+	// 网关、对 api_key 打的是 Platform 面，危害都有限，但「让 Go 的默认值代表本服务」
+	// 不该是任何一条出站路径的形态（2026-09-20 审计）。账号级覆写仍可改写它。
+	req.Header.Set("User-Agent", resolveCodexOutboundIdentity(account.GetOpenAIUserAgent()).userAgent)
 	// 账号级请求头覆写：模型列表探测与真实转发保持一致的最终头
 	account.ApplyHeaderOverrides(req.Header)
 	return req, nil
@@ -1104,7 +1119,12 @@ func (s *AccountTestService) buildOpenAIOAuthUpstreamModelsRequest(ctx context.C
 	}
 
 	identity := resolveCodexOutboundIdentity(credentialAccount.GetOpenAIUserAgent())
-	req.Header.Set("Accept", "application/json")
+	// 双开与 /models 转发同形（*/*，见 buildCodexModelsManifestRequest），其余维持既有。
+	if codexDeviceWireProfileEnabledFor(account, credentialAccount) {
+		req.Header.Set("Accept", "*/*")
+	} else {
+		req.Header.Set("Accept", "application/json")
+	}
 	req.Header.Set("Originator", identity.originator)
 	req.Header.Set("User-Agent", identity.userAgent)
 	req.Header.Set("Version", identity.version)

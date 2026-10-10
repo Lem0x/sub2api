@@ -95,6 +95,7 @@ type AdminService interface {
 	// UpdateAccountExtra 仅对 Extra 做 JSONB 增量合并（key 级覆盖），不会影响其它字段或运行态键。
 	// 用于刷新流程持久化 account_uuid / org_uuid 等少量键，避免被全量快照覆盖。
 	UpdateAccountExtra(ctx context.Context, id int64, updates map[string]any) error
+	ClearOpenAITurnStateRuntimeExtra(ctx context.Context, id int64) error
 	DeleteAccount(ctx context.Context, id int64) error
 	RefreshAccountCredentials(ctx context.Context, id int64) (*Account, error)
 	ClearAccountError(ctx context.Context, id int64) (*Account, error)
@@ -306,15 +307,16 @@ type CreateGroupInput struct {
 	// 支持的模型系列（仅 antigravity 平台使用）
 	SupportedModelScopes []string
 	// OpenAI Messages 调度配置（仅 openai 平台使用）
-	AllowMessagesDispatch       bool
-	AllowLive                   bool
-	ForceOpenAIFast             bool
-	FreeOpenAIFast              bool
-	DefaultMappedModel          string
-	RequireOAuthOnly            bool
-	RequirePrivacySet           bool
-	MessagesDispatchModelConfig OpenAIMessagesDispatchModelConfig
-	ModelAllowlist              GroupModelAllowlist
+	AllowMessagesDispatch           bool
+	AllowLive                       bool
+	ForceOpenAIFast                 bool
+	FreeOpenAIFast                  bool
+	OpenAIGatewayPoolActiveAccounts *int
+	DefaultMappedModel              string
+	RequireOAuthOnly                bool
+	RequirePrivacySet               bool
+	MessagesDispatchModelConfig     OpenAIMessagesDispatchModelConfig
+	ModelAllowlist                  GroupModelAllowlist
 	// CodexModelsManifestConfig 固定账号 manifest 配置；创建路径禁止开启，仅编辑可配置。
 	CodexModelsManifestConfig GroupCodexModelsManifestConfig
 	// RPMLimit 分组 RPM 上限（0 = 不限制）
@@ -388,15 +390,16 @@ type UpdateGroupInput struct {
 	// 支持的模型系列（仅 antigravity 平台使用）
 	SupportedModelScopes *[]string
 	// OpenAI Messages 调度配置（仅 openai 平台使用）
-	AllowMessagesDispatch       *bool
-	AllowLive                   *bool
-	ForceOpenAIFast             *bool
-	FreeOpenAIFast              *bool
-	DefaultMappedModel          *string
-	RequireOAuthOnly            *bool
-	RequirePrivacySet           *bool
-	MessagesDispatchModelConfig *OpenAIMessagesDispatchModelConfig
-	ModelAllowlist              *GroupModelAllowlist
+	AllowMessagesDispatch           *bool
+	AllowLive                       *bool
+	ForceOpenAIFast                 *bool
+	FreeOpenAIFast                  *bool
+	OpenAIGatewayPoolActiveAccounts *int
+	DefaultMappedModel              *string
+	RequireOAuthOnly                *bool
+	RequirePrivacySet               *bool
+	MessagesDispatchModelConfig     *OpenAIMessagesDispatchModelConfig
+	ModelAllowlist                  *GroupModelAllowlist
 	// CodexModelsManifestConfig nil 表示不修改；非 openai 平台会被归一化为关闭。
 	CodexModelsManifestConfig *GroupCodexModelsManifestConfig
 	// RPMLimit 分组 RPM 上限（0 = 不限制），nil 表示未提供不改动。

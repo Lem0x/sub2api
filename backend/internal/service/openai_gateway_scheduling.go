@@ -407,6 +407,11 @@ func openAICompatibleAccountEligibilityFailureReasonBeforeProfit(ctx context.Con
 	}
 	if !account.IsSchedulableForModelWithContext(ctx, requestedModel) {
 		if account.IsSchedulable() {
+			// 降智暂停借 model_rate_limits 存，但它不是限流：单独成一类，handler 据此回 503 + 说明。
+			// IsSchedulable 为真时，IsSchedulableForModelWithContext 的 false 只可能来自模型级限流。
+			if _, held := account.modelRateLimitStateForRequest(ctx, requestedModel, time.Now()); held {
+				return openAITurnStateHoldLimitReason
+			}
 			return "model_rate_limited"
 		}
 		return "not_schedulable"
@@ -927,7 +932,7 @@ func (s *OpenAIGatewayService) selectAccountForModelWithExclusionsStickyHit(ctx 
 
 	// 1. 尝试粘性会话命中
 	// Try sticky session hit
-	if account := s.tryStickySessionHit(ctx, groupID, platform, sessionHash, requestedModel, excludedIDs, requireCompact, stickyAccountID, requiredCapability); account != nil {
+	if account := s.tryStickySessionHit(ctx, groupID, platform, sessionHash, requestedModel, excludedIDs, requireCompact, stickyAccountID, requiredCapability); account != nil && !gatewayPoolPreferAlternative(ctx, account.ID) {
 		return account, true, nil
 	}
 
@@ -1112,6 +1117,7 @@ func (s *OpenAIGatewayService) selectBestAccount(ctx context.Context, groupID *i
 		compactTiers[fresh.ID] = compactTier
 	}
 
+	eligible = gatewayPoolDedupeCandidates(ctx, eligible)
 	if len(eligible) == 0 {
 		return nil, compactBlocked, filterStats
 	}
@@ -1143,6 +1149,7 @@ func (s *OpenAIGatewayService) selectBestAccount(ctx context.Context, groupID *i
 		}
 		return s.isBetterAccount(a, b)
 	})
+	gatewayPoolOrder(ctx, eligible, func(account *Account) *Account { return account })
 	return eligible[0], compactBlocked, filterStats
 }
 
@@ -1310,7 +1317,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 	stickySpillover := false
 	if sessionHash != "" {
 		accountID := stickyAccountID
-		if accountID > 0 && !isExcluded(accountID) {
+		if accountID > 0 && !isExcluded(accountID) && !gatewayPoolPreferAlternative(ctx, accountID) {
 			account, err := s.getSchedulableAccount(ctx, accountID)
 			if err == nil {
 				clearSticky := shouldClearStickySession(account, requestedModel)
@@ -1438,6 +1445,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		candidates = append(candidates, acc)
 	}
 
+	candidates = gatewayPoolDedupeCandidates(ctx, candidates)
 	if len(candidates) == 0 {
 		if rpmEligible > 0 && rpmExhausted == rpmEligible {
 			return nil, fmt.Errorf("%w: all eligible OAuth accounts are at their per-minute limit", ErrOpenAIRPMExhausted)
@@ -1464,7 +1472,12 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 			if loadInfo == nil {
 				loadInfo = &AccountLoadInfo{AccountID: acc.ID}
 			}
-			if loadInfo.LoadRate < 100 {
+			pref, poolMember := gatewayPoolPreferences(ctx)[acc.ID]
+			availableByLoad := loadInfo.LoadRate < 100
+			if poolMember && pref.activeRank > 0 {
+				availableByLoad = acc.Concurrency <= 0 || loadInfo.CurrentConcurrency < acc.Concurrency
+			}
+			if availableByLoad {
 				available = append(available, accountWithLoad{
 					account:  acc,
 					loadInfo: loadInfo,
@@ -1530,6 +1543,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 			selectionOrder = append(selectionOrder, available...)
 		}
 
+		gatewayPoolOrder(ctx, selectionOrder, func(item accountWithLoad) *Account { return item.account })
 		for _, item := range selectionOrder {
 			fresh := s.resolveFreshSchedulableOpenAIAccount(ctx, item.account, groupID, platform, requestedModel, false, requiredCapability, requireCompact)
 			if fresh == nil {
@@ -1569,6 +1583,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		if requireCompact {
 			ordered = prioritizeOpenAICompactAccounts(ordered)
 		}
+		gatewayPoolOrder(ctx, ordered, func(account *Account) *Account { return account })
 		for _, acc := range ordered {
 			fresh := s.resolveFreshSchedulableOpenAIAccount(ctx, acc, groupID, platform, requestedModel, false, requiredCapability, requireCompact)
 			if fresh == nil {
@@ -1619,6 +1634,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 	if requireCompact {
 		candidates = prioritizeOpenAICompactAccounts(candidates)
 	}
+	gatewayPoolOrder(ctx, candidates, func(account *Account) *Account { return account })
 	for _, acc := range candidates {
 		fresh := s.resolveFreshSchedulableOpenAIAccount(ctx, acc, groupID, platform, requestedModel, false, requiredCapability, requireCompact)
 		if fresh == nil {

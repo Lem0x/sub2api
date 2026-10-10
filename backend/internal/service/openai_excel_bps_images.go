@@ -97,7 +97,7 @@ func excelBPSImagesEditsUnsupportedReason(parsed *OpenAIImagesRequest) string {
 // buildExcelBPSImagesPayload reuses the Codex generations body. moderation=auto
 // is the upstream default, and BPS rejects the field itself.
 func buildExcelBPSImagesPayload(parsed *OpenAIImagesRequest, model string) ([]byte, error) {
-	body, _, err := buildOpenAIImagesOAuthPayload(parsed, model)
+	body, _, err := buildCodexDirectImagesPayload(parsed, model)
 	if err != nil {
 		return nil, err
 	}

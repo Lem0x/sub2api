@@ -29,10 +29,14 @@ type openAIWSClientFrameConn struct {
 	interTurnIdleTimeout time.Duration
 	interTurnStarted     chan struct{}
 	waitingForNextTurn   atomic.Bool
+	readClient           func(context.Context, time.Duration) (coderws.MessageType, []byte, error)
 	// The relay observes upstream payloads, while clients must keep seeing the
 	// model identifier they supplied for the current turn.
 	restoreResponseModel func([]byte) []byte
 	restoreToolNames     func([]byte) []byte
+	// noteTurnState 在下行帧写给客户端的边界记录 turn-state 铸造账号：客户端在 WS 上
+	// 持有的 blob 只来自这里转发的 response.metadata 事件。
+	noteTurnState func([]byte)
 }
 
 // openAIWSPolicyEnforcingFrameConn wraps a client-side FrameConn and runs
@@ -647,6 +651,11 @@ func (c *openAIWSClientFrameConn) ReadFrame(ctx context.Context) (coderws.Messag
 	if c.controlCtx != nil {
 		controlCtx = c.controlCtx
 	}
+	if c.readClient != nil {
+		// The session read pump already owns the socket, including after a
+		// pool attempt hands this connection to a passthrough account.
+		return c.readClient(controlCtx, 0)
+	}
 	msgType, payload, err := readOpenAIWSClientMessageWithTimeoutStart(
 		controlCtx,
 		c.conn,
@@ -684,6 +693,9 @@ func (c *openAIWSClientFrameConn) WriteFrame(ctx context.Context, msgType coderw
 		ctx = context.Background()
 	}
 	if msgType == coderws.MessageText {
+		if c.noteTurnState != nil {
+			c.noteTurnState(payload)
+		}
 		if normalized, changed := normalizeCompletedImageGenerationStatus(payload); changed {
 			payload = normalized
 		}
@@ -793,6 +805,8 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		firstClientMessage = s.ReplaceModelInBody(firstClientMessage, capturedSessionModel)
 	}
 	firstMessageResponsesLite := isOpenAIResponsesLiteWebSocketPayload(firstClientMessage)
+	// 抢在归一化删掉 internal_chat_message_metadata_passthrough（上游 #7066）之前投影时区。
+	firstClientMessage = rewriteCodexEnvironmentTimezone(c, account, firstClientMessage)
 	if normalized, compatibilityChanged, normalizeErr := normalizeOpenAIResponsesWebSocketCompatibilityBody(firstClientMessage, account, firstMessageResponsesLite); normalizeErr != nil {
 		return fmt.Errorf("normalize first websocket response.create: %w", normalizeErr)
 	} else if compatibilityChanged {
@@ -808,11 +822,18 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			firstClientMessage = aliasedBody
 		}
 	}
-	accountScopedFirst, scopeErr := s.applyCodexAccountIdentityOrHarvestPinRaw(ctx, account, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c), capturedSessionModel, firstClientMessage)
-	if scopeErr != nil {
-		return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket identity metadata", scopeErr)
+	turnState := ""
+	turnMetadata := ""
+	if c != nil {
+		// 客户端回带的 turn-state：已知由其他账号铸造（failover 换号）则剥离。
+		turnState = s.guardOpenAICodexTurnStateValue(c, account, c.GetHeader(openAIWSTurnStateHeader))
+		turnMetadata = strings.TrimSpace(c.GetHeader(openAIWSTurnMetadataHeader))
 	}
-	firstClientMessage = accountScopedFirst
+	identityFirst, identityErr := s.applyCodexWSPayloadIdentity(ctx, c, account, capturedSessionModel, firstClientMessage)
+	if identityErr != nil {
+		return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket identity metadata", identityErr)
+	}
+	firstClientMessage = identityFirst
 	usageMeta := newOpenAIWSPassthroughUsageMeta(initialRequestModel, firstClientMessage)
 	updatedFirst, blocked, policyErr := s.applyOpenAIFastPolicyToWSResponseCreate(ctx, account, capturedSessionModel, firstClientMessage)
 	if policyErr != nil {
@@ -854,6 +875,12 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	usageMeta.captureRequestedReasoningEffort(originalFirstClientMessage, capturedSessionModel)
 	_, initialUpstreamModel := usageMeta.turnModels(initialRequestModel)
 	SetOpsUpstreamModel(c, initialUpstreamModel)
+	// 手填覆写必须排在这行之后：覆写表是按模型存的，本次模型只有在 usageMeta 定完
+	// 首帧之后才知道。放在前面读到的是空串，取不到模型就不注入，等于对 WS 直通完全
+	// 不生效。turnState 直到下面构造上游请求时才被消费，挪到这里不影响其它逻辑。
+	if c != nil {
+		turnState = s.applyOpenAICodexTurnStateOverrideWSManualOnly(c, account, turnState)
+	}
 	wsURL, err := s.buildOpenAIResponsesWSURL(account)
 	if err != nil {
 		return fmt.Errorf("build ws url: %w", err)
@@ -878,12 +905,6 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	}
 	if s.cfg != nil && s.cfg.Gateway.ForceCodexCLI {
 		isCodexCLI = true
-	}
-	turnState := ""
-	turnMetadata := ""
-	if c != nil {
-		turnState = strings.TrimSpace(c.GetHeader(openAIWSTurnStateHeader))
-		turnMetadata = strings.TrimSpace(c.GetHeader(openAIWSTurnMetadataHeader))
 	}
 	headers, _, buildHdrErr := s.buildOpenAIWSHeaders(
 		ctx,
@@ -927,9 +948,16 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		if err != nil {
 			return fmt.Errorf("refresh ws authentication headers: %w", err)
 		}
+		// 透传适配器不经连接池，cookie 回放在这里挂钩（池的对应点在 dialConn）。
+		// 还票闭包恒为 nil：网关池账号走不到这里（选路层已降级成 HTTP/SSE，兜底闸也在取票之前）。
+		if _, err := s.codexCookies.AttachRoute(ctx, account, wsURL, headers); err != nil {
+			return fmt.Errorf("attach ws route cookies: %w", err)
+		}
 		dialCtx, cancelDial := context.WithTimeout(upstreamroute.WithAccountID(ctx, account.ID), s.openAIWSDialTimeout())
-		upstreamConn, statusCode, handshakeHeaders, err = dialer.Dial(dialCtx, wsURL, headers, proxyURL)
+		upstreamConn, statusCode, handshakeHeaders, err = s.dialRecordedOpenAIWS(dialCtx, account, wsURL, headers, proxyURL, dialer)
 		cancelDial()
+		// 握手成败都收 Set-Cookie（与连接池、doOpenAIUpstream 同口径：Cloudflare 在 4xx/5xx 上同样下发）。
+		s.codexCookies.Store(account, wsURL, handshakeHeaders)
 		if err == nil {
 			break
 		}
@@ -1042,6 +1070,12 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		restoreToolNames: func(payload []byte) []byte {
 			return restoreCodexToolNamesFromContext(c, payload)
 		},
+		noteTurnState: func(payload []byte) {
+			s.noteOpenAICodexTurnStateFromWSEvent(c, account, payload)
+		},
+	}
+	if hooks != nil {
+		clientFrameConn.readClient = hooks.ClientReadMessage
 	}
 	policyClientConn := &openAIWSPolicyEnforcingFrameConn{
 		inner: clientFrameConn,
@@ -1076,6 +1110,8 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			}
 			responsesLite := isResponseCreate && isOpenAIResponsesLiteWebSocketPayload(payload)
 			if isResponseCreate {
+				// 抢在归一化删掉 internal_chat_message_metadata_passthrough（上游 #7066）之前投影时区。
+				payload = rewriteCodexEnvironmentTimezone(c, account, payload)
 				if normalized, compatibilityChanged, normalizeErr := normalizeOpenAIResponsesWebSocketCompatibilityBody(payload, account, responsesLite); normalizeErr != nil {
 					return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", normalizeErr)
 				} else if compatibilityChanged {
@@ -1092,11 +1128,17 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					payload = aliasedBody
 				}
 			}
-			if isResponseCreate || eventType == "session.update" {
-				identityModel := capturedSessionModel
-				if mapped := strings.TrimSpace(gjson.GetBytes(payload, "model").String()); mapped != "" {
-					identityModel = mapped
+			identityModel := capturedSessionModel
+			if mapped := strings.TrimSpace(gjson.GetBytes(payload, "model").String()); mapped != "" {
+				identityModel = mapped
+			}
+			if isResponseCreate {
+				identityPayload, identityErr := s.applyCodexWSPayloadIdentity(ctx, c, account, identityModel, payload)
+				if identityErr != nil {
+					return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket identity metadata", identityErr)
 				}
+				payload = identityPayload
+			} else if eventType == "session.update" {
 				accountScopedPayload, scopeErr := s.applyCodexAccountIdentityOrHarvestPinRaw(ctx, account, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c), identityModel, payload)
 				if scopeErr != nil {
 					return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket identity metadata", scopeErr)
@@ -1234,6 +1276,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					return out, nil, err
 				}
 				activePolicyModel.Store(&model)
+				// 双开：后续帧的发送边界，与首帧同一收口。
+				out = s.guardOpenAICodexWSFrameTurnState(c, account, out)
+				out = applyCodexWSFrameWireProfile(c, account, out, turnState)
+				s.scheduleCodexWSSideCalls(c, account, headers, out)
 				usageMeta.updateFromResponseCreate(out, model, requestModelForThisFrame)
 				_, actualModel := usageMeta.turnModels(requestModelForThisFrame)
 				SetOpsUpstreamModel(c, actualModel)
@@ -1281,6 +1327,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		return err
 	}
 	firstWriteCtx, cancelFirstWrite := context.WithTimeout(ctx, s.openAIWSWriteTimeout())
+	// 双开：首帧的发送边界——turn-state 走帧内、字段序对齐真客户端（握手上已被投影删掉）。
+	firstClientMessage = s.guardOpenAICodexWSFrameTurnState(c, account, firstClientMessage)
+	firstClientMessage = applyCodexWSFrameWireProfile(c, account, firstClientMessage, turnState)
+	s.scheduleCodexWSSideCalls(c, account, headers, firstClientMessage)
 	firstWriteErr := relayUpstreamFrameConn.WriteFrame(firstWriteCtx, coderws.MessageText, firstClientMessage)
 	cancelFirstWrite()
 	if firstWriteErr != nil {

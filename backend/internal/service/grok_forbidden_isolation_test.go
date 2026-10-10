@@ -253,7 +253,7 @@ func TestSuccessfulTestDoesNotClearHiddenGrokProcessBlock(t *testing.T) {
 	repo := &rateLimitClearRepoStub{getByIDAccount: account}
 	svc := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
 
-	result, err := svc.RecoverAccountAfterSuccessfulTest(context.Background(), accountID)
+	result, err := svc.RecoverAccountAfterSuccessfulTest(context.Background(), accountID, false)
 
 	require.NoError(t, err)
 	require.False(t, result.ClearedRateLimit)
@@ -274,7 +274,7 @@ func TestSuccessfulTestWithAccountCooldownPreservesOtherModelAndTeamBlock(t *tes
 	markGrokTeamModelRateLimit(account, "grok-heavy", until)
 	repo := &rateLimitClearRepoStub{getByIDAccount: account}
 	svc := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
-	result, err := svc.RecoverAccountAfterSuccessfulTest(context.Background(), accountID)
+	result, err := svc.RecoverAccountAfterSuccessfulTest(context.Background(), accountID, false)
 	require.NoError(t, err)
 	require.True(t, result.ClearedRateLimit)
 	require.Zero(t, repo.clearModelRateLimitCalls)

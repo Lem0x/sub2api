@@ -22,10 +22,12 @@ func (s *OpenAIGatewayService) isOpenAIWSGeneratePrewarmEnabled() bool {
 // 预热默认关闭，仅在配置开启后生效；失败时按可恢复错误回退到 HTTP。
 func (s *OpenAIGatewayService) performOpenAIWSGeneratePrewarm(
 	ctx context.Context,
+	c *gin.Context,
 	lease *openAIWSConnLease,
 	decision OpenAIWSProtocolDecision,
 	payload map[string]any,
 	previousResponseID string,
+	turnState string,
 	reqBody map[string]any,
 	account *Account,
 	stateStore OpenAIWSStateStore,
@@ -86,7 +88,20 @@ func (s *OpenAIGatewayService) performOpenAIWSGeneratePrewarm(
 	if err := s.acquireOpenAIRPMForSend(ctx, account); err != nil {
 		return err
 	}
-	if err := lease.WriteJSONWithContextTimeout(ctx, prewarmPayload, s.openAIWSWriteTimeout()); err != nil {
+	var writeErr error
+	if codexDeviceWireProfileEnabled(c, account) {
+		// 双开：预热帧与正式帧是同一个 ResponseCreateWsRequest（core/src/client.rs:1864-1884，
+		// 只是 generate=false），走同一条收口、同样字节原样写出。
+		raw, marshalErr := marshalOpenAIUpstreamJSON(prewarmPayload)
+		if marshalErr != nil {
+			return wrapOpenAIWSFallback("prewarm_write", marshalErr)
+		}
+		prewarmPayloadJSON = applyCodexWSFrameWireProfile(c, account, raw, turnState)
+		writeErr = lease.WriteTextWithContextTimeout(ctx, prewarmPayloadJSON, s.openAIWSWriteTimeout())
+	} else {
+		writeErr = lease.WriteJSONWithContextTimeout(ctx, prewarmPayload, s.openAIWSWriteTimeout())
+	}
+	if err := writeErr; err != nil {
 		lease.MarkBroken()
 		logOpenAIWSModeInfo(
 			"prewarm_write_fail account_id=%d conn_id=%s cause=%s",
@@ -573,7 +588,14 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 	// survive an HTTP fallback. Official API-key Responses HTTP requests are
 	// different: previous_response_id is supported by the provider and scoped to
 	// the selected key/project, so the response-id binding must retain that key.
-	if !account.IsOpenAIApiKey() && s.getOpenAIWSProtocolResolver().Resolve(account).Transport != OpenAIUpstreamTransportResponsesWebsocketV2 {
+	// 网关池接管的账号实际走 HTTP/SSE（选路层降级，openai_gwpool.go）。Resolve 不带这一道过滤，
+	// 不补的话这种账号会被判成 WSv2 ⇒ 绑定留着 ⇒ 下一发被钉回这个账号再走 HTTP，而按这条判据
+	// 自己的理由（HTTP 上游没有 WSv2 的延续态），绑定就该丢掉。
+	wsDecision := s.getOpenAIWSProtocolResolver().Resolve(account)
+	if gatewayPoolTakesOverWSUpstream(wsDecision, account) {
+		wsDecision = openAIWSHTTPDecision("gwpool_takeover")
+	}
+	if !account.IsOpenAIApiKey() && wsDecision.Transport != OpenAIUpstreamTransportResponsesWebsocketV2 {
 		return 0, nil, "", nil
 	}
 	if shouldClearStickySession(account, requestedModel) || !account.IsOpenAI() || !account.IsSchedulable() {

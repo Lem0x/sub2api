@@ -801,9 +801,12 @@
         </div>
       </div>
 
-      <!-- OpenAI/Grok OAuth Model Mapping (OAuth 类型没有 apikey 容器，需要独立的模型映射区域) -->
+      <!-- OpenAI/Grok OAuth Model Mapping (OAuth 类型没有 apikey 容器，需要独立的模型映射区域)
+           cpr 同理：它的凭据容器只有 5 个输入框，此前整个弹窗找不到「模型限制」，
+           而后端 GetModelMapping() / IsModelSupported() 只读 credentials.model_mapping，
+           与账号类型无关，调度器筛候选集时对 cpr 一视同仁地跑这套逻辑。 -->
       <div
-        v-if="(account.platform === 'openai' || account.platform === 'grok') && account.type === 'oauth'"
+        v-if="((account.platform === 'openai' || account.platform === 'grok') && account.type === 'oauth') || (account.platform === 'openai' && account.type === 'cpr')"
         class="border-t border-gray-200 pt-4 dark:border-dark-600"
       >
         <label class="input-label">{{ t('admin.accounts.modelRestriction') }}</label>
@@ -958,6 +961,35 @@
             placeholder="sk-..."
           />
           <p class="input-hint">{{ t('admin.accounts.leaveEmptyToKeep') }}</p>
+        </div>
+      </div>
+
+      <!-- CPR 中继（密钥留空表示不修改） -->
+      <div v-if="account.type === 'cpr'" class="space-y-4">
+        <div>
+          <label class="input-label">{{ t('admin.accounts.cpr.baseUrl') }}</label>
+          <input v-model="editCprBaseUrl" type="text" class="input" placeholder="http://127.0.0.1:18081" />
+          <p class="input-hint">{{ t('admin.accounts.cpr.baseUrlHint') }}</p>
+        </div>
+        <div>
+          <label class="input-label">{{ t('admin.accounts.cpr.accountId') }}</label>
+          <input v-model="editCprAccountId" type="text" class="input font-mono" placeholder="acct_..." />
+          <p class="input-hint">{{ t('admin.accounts.cpr.accountIdHint') }}</p>
+        </div>
+        <div>
+          <label class="input-label">{{ t('admin.accounts.cpr.clientKey') }}</label>
+          <input v-model="editCprClientKey" type="password" autocomplete="off" class="input font-mono" placeholder="sk_..." />
+          <p class="input-hint">{{ t('admin.accounts.leaveEmptyToKeep') }}</p>
+        </div>
+        <div>
+          <label class="input-label">{{ t('admin.accounts.cpr.adminApiKey') }}</label>
+          <input v-model="editCprAdminApiKey" type="password" autocomplete="off" class="input font-mono" placeholder="admin-..." />
+          <p class="input-hint">{{ t('admin.accounts.leaveEmptyToKeep') }}</p>
+        </div>
+        <div>
+          <label class="input-label">{{ t('admin.accounts.cpr.adminBaseUrl') }}</label>
+          <input v-model="editCprAdminBaseUrl" type="text" class="input" :placeholder="editCprBaseUrl || 'http://127.0.0.1:18081'" />
+          <p class="input-hint">{{ t('admin.accounts.cpr.adminBaseUrlHint') }}</p>
         </div>
       </div>
 
@@ -1718,6 +1750,16 @@
           <ProxyAdBanner />
         </div>
         <ProxySelector v-model="form.proxy_id" :proxies="proxies" />
+        <!-- cpr 账号：上面这个选择器改的是 sub2api→CPR 那一跳（现网 127.0.0.1），
+             真正的出口 IP 由 CPR 侧的账号配置决定。不说明的话，在这里换代理会被
+             当成「换出口」，而它一点用都没有。 -->
+        <p
+          v-if="cprOutboundProxy"
+          class="mt-1 text-xs text-amber-600 dark:text-amber-400"
+          data-testid="edit-account-cpr-outbound"
+        >
+          {{ t('admin.accounts.cprOutboundHint', { endpoint: cprOutboundProxy }) }}
+        </p>
       </div>
 
       <UpstreamRequestIdHeaderField
@@ -2020,6 +2062,37 @@
         </div>
       </div>
 
+      <!-- 原样中继（klno，仅 OpenAI API Key）：下一跳是另一个 sub2api 时用 -->
+      <div
+        v-if="account?.platform === 'openai' && account?.type === 'apikey'"
+        class="border-t border-gray-200 pt-4 dark:border-dark-600"
+      >
+        <div class="flex items-center justify-between">
+          <div>
+            <label class="input-label mb-0">{{ t('admin.accounts.openai.rawRelay') }}</label>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.accounts.openai.rawRelayDesc') }}
+            </p>
+          </div>
+          <button
+            type="button"
+            data-testid="edit-openai-raw-relay-toggle"
+            @click="openaiRawRelayEnabled = !openaiRawRelayEnabled"
+            :class="[
+              'relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2',
+              openaiRawRelayEnabled ? 'bg-primary-600' : 'bg-gray-200 dark:bg-dark-600'
+            ]"
+          >
+            <span
+              :class="[
+                'pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out',
+                openaiRawRelayEnabled ? 'translate-x-5' : 'translate-x-0'
+              ]"
+            />
+          </button>
+        </div>
+      </div>
+
       <!-- OpenAI Codex namespace 工具摊平（兼容开关，仅 OAuth） -->
       <div
         v-if="account?.platform === 'openai' && account?.type === 'oauth'"
@@ -2053,7 +2126,7 @@
 
       <!-- OpenAI Codex hosted image_generation bridge policy -->
       <div
-        v-if="account?.platform === 'openai' && (account?.type === 'oauth' || account?.type === 'setup-token' || account?.type === 'apikey')"
+        v-if="accountHasOpenAIExtraSettings"
         class="border-t border-gray-200 pt-4 dark:border-dark-600"
       >
         <div class="overflow-hidden rounded-lg border border-sky-100 bg-sky-50/60 shadow-sm dark:border-sky-900/50 dark:bg-sky-950/20">
@@ -2518,7 +2591,7 @@
 
       <!-- OpenAI API 长上下文计费开关 -->
       <div
-        v-if="account?.platform === 'openai' && !isSparkShadow && !hideAccountLongContextBilling && (account?.type === 'oauth' || account?.type === 'setup-token' || account?.type === 'apikey')"
+        v-if="accountHasOpenAIExtraSettings && !isSparkShadow && !hideAccountLongContextBilling"
         class="border-t border-gray-200 pt-4 dark:border-dark-600"
       >
         <div class="flex items-center justify-between gap-4">
@@ -2651,6 +2724,45 @@
         </div>
       </div>
 
+      <!-- 账号级出站 User-Agent（仅 OpenAI OAuth）：留空回落到全局设置 -->
+      <div
+        v-if="account?.platform === 'openai' && account?.type === 'oauth'"
+        class="border-t border-gray-200 pt-4 dark:border-dark-600"
+      >
+        <label class="input-label">{{ t('admin.accounts.openai.codexUserAgent') }}</label>
+        <p class="mt-1 mb-2 text-xs text-gray-500 dark:text-gray-400">
+          {{ t('admin.accounts.openai.codexUserAgentDesc') }}
+        </p>
+        <input
+          v-model="codexUserAgent"
+          type="text"
+          class="input"
+          data-testid="edit-codex-user-agent-input"
+          :placeholder="t('admin.accounts.openai.codexUserAgentPlaceholder')"
+        />
+      </div>
+
+      <!-- klno 实验性指纹收敛：按账号开关，见 backend/internal/service/openai_codex_fingerprint_convergence.go -->
+      <div
+        v-if="account?.platform === 'openai' && account?.type === 'oauth'"
+        class="border-t border-gray-200 pt-4 dark:border-dark-600"
+      >
+        <div class="flex items-center justify-between gap-4">
+          <div class="min-w-0">
+            <label class="input-label mb-0">{{ t('admin.accounts.openai.codexFingerprintConvergence') }}</label>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.accounts.openai.codexFingerprintConvergenceDesc') }}
+            </p>
+          </div>
+          <input
+            v-model="codexFingerprintConvergence"
+            data-testid="edit-codex-fingerprint-convergence"
+            type="checkbox"
+            class="h-4 w-4 flex-shrink-0 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+          />
+        </div>
+      </div>
+
       <!-- OpenAI 订阅档位手动覆盖（Plus/Pro/Free），仅 OAuth 非影子账号 -->
       <div
         v-if="account?.platform === 'openai' && account?.type === 'oauth' && !isSparkShadow"
@@ -2670,9 +2782,256 @@
       </div>
 
       <div
-        v-if="account?.platform === 'openai' && (account?.type === 'oauth' || account?.type === 'setup-token' || account?.type === 'apikey')"
+        v-if="accountHasOpenAIExtraSettings"
         class="border-t border-gray-200 pt-4 dark:border-dark-600 space-y-4"
       >
+        <div v-if="accountSupportsTurnStateRecovery" class="space-y-3">
+          <!-- 降智恢复探测：独立于猎手的开关，走账号自己的出口，只标记不改配置。 -->
+          <div class="mt-3 rounded-lg border border-gray-200 p-3 dark:border-dark-700">
+            <div class="flex items-center justify-between gap-4">
+              <div class="min-w-0">
+                <label class="input-label mb-0 text-xs">{{ t('admin.accounts.openai.turnStateRecovery') }}</label>
+                <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                  {{ t('admin.accounts.openai.turnStateRecoveryDesc') }}
+                </p>
+              </div>
+              <input
+                v-model="openAITurnStateRecovery.enabled"
+                data-testid="edit-openai-turn-state-recovery"
+                type="checkbox"
+                class="h-4 w-4 flex-shrink-0 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+              />
+            </div>
+            <div v-if="openAITurnStateRecovery.enabled" class="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <div class="col-span-2">
+                <label class="input-label text-xs">{{ t('admin.accounts.openai.turnStateRecoveryModel') }}</label>
+                <input
+                  v-model="openAITurnStateRecovery.model"
+                  type="text"
+                  :placeholder="t('admin.accounts.openai.turnStateRecoveryModelAuto')"
+                  class="input text-xs"
+                  data-testid="edit-openai-turn-state-recovery-model"
+                />
+              </div>
+              <div>
+                <label class="input-label text-xs">{{ t('admin.accounts.openai.turnStateRecoveryStreak') }}</label>
+                <input v-model.number="openAITurnStateRecovery.streak_target" type="number" min="1" max="50" placeholder="5" class="input text-xs" />
+              </div>
+              <div>
+                <label class="input-label text-xs">{{ t('admin.accounts.openai.turnStateRecoverySuccess') }}</label>
+                <input
+                  v-model.number="openAITurnStateRecovery.success_target"
+                  type="number"
+                  min="1"
+                  max="50"
+                  placeholder="4"
+                  class="input text-xs"
+                  data-testid="edit-openai-turn-state-recovery-success"
+                />
+              </div>
+              <div>
+                <label class="input-label text-xs">{{ t('admin.accounts.openai.turnStateRecoveryCooldown') }}</label>
+                <input v-model.number="openAITurnStateRecovery.cooldown_hours" type="number" min="1" max="168" placeholder="16" class="input text-xs" />
+              </div>
+              <div>
+                <label class="input-label text-xs">{{ t('admin.accounts.openai.turnStateRecoveryMin') }}</label>
+                <input v-model.number="openAITurnStateRecovery.min_minutes" type="number" min="1" max="1440" placeholder="30" class="input text-xs" />
+              </div>
+              <div>
+                <label class="input-label text-xs">{{ t('admin.accounts.openai.turnStateRecoveryMax') }}</label>
+                <input v-model.number="openAITurnStateRecovery.max_minutes" type="number" min="1" max="1440" placeholder="90" class="input text-xs" />
+              </div>
+              <div>
+                <label class="input-label text-xs">{{ t('admin.accounts.openai.turnStateHunterUsageKey') }}</label>
+                <input
+                  v-model.number="openAITurnStateRecovery.usage_api_key_id"
+                  type="number"
+                  min="1"
+                  step="1"
+                  class="input text-xs"
+                  data-testid="edit-openai-turn-state-recovery-usage-key"
+                  :title="t('admin.accounts.openai.turnStateHunterUsageKeyDesc')"
+                />
+              </div>
+              <div>
+                <label class="input-label text-xs">{{ t('admin.accounts.openai.turnStateHunterEffort') }}</label>
+                <select v-model="openAITurnStateRecovery.reasoning_effort" class="input text-xs" data-testid="edit-openai-turn-state-recovery-effort">
+                  <option value="">{{ t('admin.accounts.openai.turnStateRecoveryEffortDefault') }}</option>
+                  <option v-for="e in turnStateProbeEfforts" :key="e" :value="e">{{ e }}</option>
+                </select>
+              </div>
+            </div>
+          </div>
+        </div>
+        <!-- 网关池：Codex 推理面的路由 cookie（__cflb / __oailb）改由池子下发，顶掉按账号罐回放。
+             配置全在账号级：池子的 consumer key 是按账号发的。 -->
+        <div
+          v-if="accountSupportsGatewayPool"
+          class="space-y-3 rounded-lg border border-gray-200 p-4 dark:border-dark-600"
+          data-testid="edit-openai-gwpool-section"
+        >
+          <div class="flex items-center justify-between gap-4">
+            <div class="min-w-0">
+              <label class="input-label mb-0">{{ t('admin.accounts.openai.gwpool') }}</label>
+              <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                {{ t('admin.accounts.openai.gwpoolDesc') }}
+              </p>
+            </div>
+            <input
+              v-model="openAIGwpoolEnabled"
+              data-testid="edit-openai-gwpool-enabled"
+              type="checkbox"
+              class="h-4 w-4 flex-shrink-0 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+            />
+          </div>
+          <div v-if="openAIGwpoolEnabled" class="space-y-3">
+            <div>
+              <label class="input-label text-xs">{{ t('admin.accounts.openai.gwpoolBaseUrl') }}</label>
+              <input
+                v-model="openAIGwpoolBaseURL"
+                type="url"
+                inputmode="url"
+                placeholder="https://pool.0102400.xyz"
+                class="input text-xs"
+                data-testid="edit-openai-gwpool-base-url"
+              />
+              <!-- 用户踩过的坑：填了池子给的 /a/xxxx 个人页面地址，而网关要的是根地址。 -->
+              <p class="input-hint" data-testid="edit-openai-gwpool-base-url-hint">
+                {{ t('admin.accounts.openai.gwpoolBaseUrlDesc') }}
+              </p>
+            </div>
+            <div>
+              <label class="input-label text-xs">{{ t('admin.accounts.openai.gwpoolConsumerKey') }}</label>
+              <input
+                v-model="openAIGwpoolConsumerKey"
+                type="password"
+                autocomplete="off"
+                :placeholder="
+                  openAIGwpoolConsumerKeySaved
+                    ? t('admin.accounts.openai.gwpoolConsumerKeyKeep')
+                    : t('admin.accounts.openai.gwpoolConsumerKeyPlaceholder')
+                "
+                class="input text-xs"
+                data-testid="edit-openai-gwpool-consumer-key"
+              />
+              <p class="input-hint">{{ t('admin.accounts.openai.gwpoolConsumerKeyDesc') }}</p>
+            </div>
+            <div class="flex items-center justify-between gap-4" data-testid="edit-openai-gwpool-wait-policy">
+              <div class="min-w-0">
+                <label class="input-label mb-0 text-xs">{{ t('admin.accounts.openai.gwpoolContinuousWait') }}</label>
+                <p class="input-hint">{{ t('admin.accounts.openai.gwpoolContinuousWaitDesc') }}</p>
+              </div>
+              <input v-model="openAIGwpoolContinuousWait" data-testid="edit-openai-gwpool-continuous-wait"
+                type="checkbox" class="h-4 w-4 flex-shrink-0 rounded border-gray-300 text-primary-600 focus:ring-primary-500" />
+            </div>
+            <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div>
+              <label class="input-label text-xs">{{ t('admin.accounts.openai.gwpoolProbeTimeout') }}</label>
+              <input v-model.number="openAIGwpoolProbeTimeout" data-testid="edit-openai-gwpool-probe-timeout"
+                type="number" min="1" max="120" step="1" placeholder="10" class="input text-xs" />
+              <p class="input-hint">{{ t('admin.accounts.openai.gwpoolProbeTimeoutDesc') }}</p>
+            </div>
+            <div>
+              <label class="input-label text-xs">{{ t('admin.accounts.openai.gwpoolPrepareRetries') }}</label>
+              <input v-model.number="openAIGwpoolPrepareRetries" data-testid="edit-openai-gwpool-prepare-retries"
+                type="number" min="0" max="10" step="1" placeholder="0" class="input text-xs" />
+              <p class="input-hint">{{ t('admin.accounts.openai.gwpoolPrepareRetriesDesc') }}</p>
+            </div>
+            </div>
+            <p class="input-hint" data-testid="edit-openai-gwpool-credential-scope">
+              {{ t('admin.accounts.openai.gwpoolCredentialScope') }}
+            </p>
+            <fieldset :disabled="openAIGwpoolContinuousWait" class="grid grid-cols-1 gap-3 sm:grid-cols-2" data-testid="edit-openai-gwpool-thresholds">
+            <div>
+              <label class="input-label text-xs">{{ t('admin.accounts.openai.gwpoolResumeGateways') }}</label>
+              <input v-model.number="openAIGwpoolResumeGateways" type="number" min="1" max="512" step="1"
+                placeholder="50" class="input text-xs" data-testid="edit-openai-gwpool-resume-gateways" />
+              <p class="input-hint">{{ t('admin.accounts.openai.gwpoolResumeGatewaysDesc') }}</p>
+            </div>
+            </fieldset>
+            <p v-if="openAIGwpoolContinuousWait" class="input-hint">{{ t('admin.accounts.openai.gwpoolContinuousWaitInactiveLimits') }}</p>
+            <p class="input-hint">{{ t('admin.accounts.openai.gwpoolCandidatesHint') }}</p>
+            <div>
+              <div class="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div>
+                  <label class="input-label text-xs">{{ t('admin.accounts.openai.gwpoolGatewayWindow') }}</label>
+                  <input
+                    v-model.number="openAIGwpoolGatewayWindow"
+                    type="number"
+                    min="3600"
+                    max="86400"
+                    step="1"
+                    placeholder="3600"
+                    class="input text-xs"
+                    data-testid="edit-openai-gwpool-gateway-window"
+                    :title="t('admin.accounts.openai.gwpoolGatewayWindowDesc')"
+                  />
+                  <p class="input-hint">{{ t('admin.accounts.openai.gwpoolGatewayWindowDesc') }}</p>
+                </div>
+                <div>
+                  <label class="input-label text-xs" for="edit-openai-gwpool-cooldown-reset">{{ t('admin.accounts.openai.gwpoolCooldownResetHours') }}</label>
+                  <input
+                    id="edit-openai-gwpool-cooldown-reset"
+                    v-model.number="openAIGwpoolCooldownResetHours"
+                    type="number"
+                    min="0"
+                    :max="gatewayPoolCooldownResetMaxHours"
+                    step="1"
+                    :placeholder="String(gatewayPoolCooldownResetDefaultHours)"
+                    class="input text-xs"
+                    data-testid="edit-openai-gwpool-cooldown-reset"
+                  />
+                  <p class="input-hint">{{ t('admin.accounts.openai.gwpoolCooldownResetDesc') }}</p>
+                </div>
+              </div>
+            </div>
+            <details class="rounded-lg bg-gray-50 p-3 dark:bg-dark-700" data-testid="edit-openai-gwpool-advanced">
+              <summary class="cursor-pointer text-xs font-medium">{{ t('admin.accounts.openai.gwpoolAdvanced') }}</summary>
+              <div class="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div>
+                  <label class="input-label text-xs">{{ t('admin.accounts.openai.gwpoolFetchTimeout') }}</label>
+                  <input
+                    v-model.number="openAIGwpoolFetchTimeout"
+                    type="number"
+                    min="1"
+                    max="86400"
+                    step="1"
+                    placeholder="10"
+                    class="input text-xs"
+                    data-testid="edit-openai-gwpool-fetch-timeout"
+                    :title="t('admin.accounts.openai.gwpoolFetchTimeoutDesc')"
+                  />
+                  <p class="input-hint">{{ t('admin.accounts.openai.gwpoolFetchTimeoutDesc') }}</p>
+                </div>
+                <div>
+                  <label class="input-label text-xs">{{ t('admin.accounts.openai.gwpoolListTimeout') }}</label>
+                  <input
+                    v-model.number="openAIGwpoolListTimeout"
+                    type="number"
+                    min="1"
+                    max="86400"
+                    step="1"
+                    placeholder="2"
+                    class="input text-xs"
+                    data-testid="edit-openai-gwpool-list-timeout"
+                    :title="t('admin.accounts.openai.gwpoolListTimeoutDesc')"
+                  />
+                  <p class="input-hint">{{ t('admin.accounts.openai.gwpoolListTimeoutDesc') }}</p>
+                </div>
+              </div>
+            </details>
+            <details class="rounded-lg bg-gray-50 p-3 dark:bg-dark-700" data-testid="edit-openai-gwpool-details">
+              <summary class="cursor-pointer text-xs font-medium">
+                {{ t('admin.accounts.openai.gwpoolDetails') }}
+              </summary>
+              <div class="mt-2 space-y-2">
+                <p class="input-hint">{{ t('admin.accounts.openai.gwpoolCooldownDetails') }}</p>
+                <p class="input-hint">{{ t('admin.accounts.openai.gwpoolGuardDetails') }}</p>
+                <p class="input-hint">{{ t('admin.accounts.openai.gwpoolWarmDetails') }}</p>
+              </div>
+            </details>
+          </div>
+        </div>
         <div class="flex items-center justify-between">
           <div>
             <label class="input-label mb-0">{{ t('admin.accounts.openai.compactMode') }}</label>
@@ -2753,6 +3112,21 @@
             />
           </button>
         </div>
+      </div>
+
+      <div v-if="account?.platform === 'openai'" class="border-t border-gray-200 pt-4 dark:border-dark-600">
+        <label class="flex items-center gap-2">
+          <input
+            v-model="openAIUpstreamRecordingEnabled"
+            type="checkbox"
+            class="checkbox"
+            data-testid="openai-upstream-recording-enabled"
+          />
+          <span class="input-label mb-0">{{ t('admin.accounts.upstreamRecordingTitle') }}</span>
+        </label>
+        <p class="input-hint mt-2 text-amber-700 dark:text-amber-400">
+          {{ t('admin.accounts.upstreamRecordingHint') }}
+        </p>
       </div>
 
       <div
@@ -3358,6 +3732,9 @@ import BaseDialog from '@/components/common/BaseDialog.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import Select from '@/components/common/Select.vue'
 import HelpTooltip from '@/components/common/HelpTooltip.vue'
+import {
+  cprOutboundProxy as readCPROutboundProxy
+} from '@/utils/turnState'
 import UpstreamRequestIdHeaderField from '@/components/account/UpstreamRequestIdHeaderField.vue'
 import Toggle from '@/components/common/Toggle.vue'
 import AccountRpmSettings from '@/components/account/AccountRpmSettings.vue'
@@ -3489,6 +3866,19 @@ const groupsForModelLimits = computed(() => {
 
 // Spark 影子账号(parent_account_id 非空):代理恒继承母账号,不可独立编辑(外审 B/P1),
 // 故隐藏代理选择器。
+// openai 平台上「后端确实会读这些 extra」的账号类型。cpr 必须在列：
+// 自动暂停阈值、长上下文计费、compact 模式、Codex 图像桥接在后端都只按 platform
+// 判定（shouldAutoPauseOpenAIAccountByQuota / openAILongContextBillingGate /
+// GetOpenAICompactMode / CodexImageGenerationBridgeOverride），漏掉 cpr 会让控件
+// 可见可改、保存却静默丢弃。
+// 回填与写入必须共用本判定：只改一头会造成「保存后一刷新变默认值」的假象。
+// 不含 cpr 的另两处（自动透传 v-if、WS 模式 v-if）是刻意的——后端
+// IsOpenAIPassthroughEnabled / ResolveOpenAIResponsesWebSocketV2Mode 对 cpr 硬返回 false。
+const hasOpenAIExtraSettings = (account?: { platform?: string; type?: string } | null): boolean =>
+  account?.platform === 'openai' &&
+  (account.type === 'oauth' || account.type === 'setup-token' || account.type === 'apikey' || account.type === 'cpr')
+
+const accountHasOpenAIExtraSettings = computed(() => hasOpenAIExtraSettings(props.account))
 const isSparkShadow = computed(() => props.account?.parent_account_id != null)
 
 // 「降智后自动开启 BPS」与后端 QualityBPSEligible 一致：只有普通 ChatGPT OAuth 母账号（不含 PAT、Agent Identity）。
@@ -3631,11 +4021,18 @@ interface TempUnschedRuleForm {
 
 // State
 const submitting = ref(false)
+const openAIUpstreamRecordingEnabled = ref(false)
 const editBaseUrl = ref('https://api.anthropic.com')
 const editApiKey = ref('')
 const prismBrowserEnabled = ref(false)
 const prismSupportedModels = ['gpt-6.1-sol', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-6-luna']
 const prismBrowserModels = ref<string[]>([...prismSupportedModels])
+// CPR 中继：两把密钥留空表示保持不变，不回显明文。
+const editCprBaseUrl = ref('')
+const editCprAccountId = ref('')
+const editCprClientKey = ref('')
+const editCprAdminApiKey = ref('')
+const editCprAdminBaseUrl = ref('')
 
 // ── 国产供应商（Kimi / Zhipu / DeepSeek）account_mode / api_protocol 编辑 ──
 // account_mode 决定额度/余额监控路径，api_protocol 决定转发端点与格式；
@@ -3926,6 +4323,115 @@ const isNewAPIUpstream = computed(() => props.account?.extra?.upstream_billing_p
 const mixedScheduling = ref(false) // For antigravity accounts: enable mixed scheduling
 // 上游ID：直接上游声明请求标识的响应头名，留空不记录。
 const upstreamRequestIdHeader = ref('')
+/**
+ * cpr 账号在 CPR 侧绑的出站代理。只对 cpr 账号有值。
+ *
+ * 它存在的理由是本弹窗里的 ProxySelector 具有误导性：那个选择器改的是 sub2api→CPR
+ * 的一跳，而 cpr 账号的这一跳是 127.0.0.1，真正的出口在 CPR 自己的配置里。
+ * 读取与脱敏走共享的 readCPROutboundProxy（见 utils/turnState）。
+ */
+const cprOutboundProxy = computed(() => readCPROutboundProxy(props.account))
+
+// 降智恢复探测（extra.openai_turn_state_recovery）：走账号**自己的出口**、间隔随机，每次出一道
+// 糖果题，最近 streak_target 次里答对 success_target 次判定恢复并打标记；连续 streak_target 次
+// 失败进 cooldown_hours 冷却。只标记，不改配置。
+interface TurnStateRecoveryConfig {
+  enabled: boolean
+  /** 探哪个模型；留空 = gpt-5.6-sol。 */
+  model: string
+  /** 判定窗口（总次数）。 */
+  streak_target: number | null
+  /** 窗口内需要答对的次数。 */
+  success_target: number | null
+  min_minutes: number | null
+  max_minutes: number | null
+  cooldown_hours: number | null
+  reasoning_effort: string
+  /** 记账 API Key ID；留空回落猎手那把（猎手关着时它的输入框不渲染，所以这里要有自己的）。 */
+  usage_api_key_id: number | null
+}
+const emptyTurnStateRecovery = (): TurnStateRecoveryConfig => ({
+  enabled: false,
+  model: '',
+  streak_target: null,
+  success_target: null,
+  min_minutes: null,
+  max_minutes: null,
+  cooldown_hours: null,
+  reasoning_effort: '',
+  usage_api_key_id: null
+})
+const readOpenAITurnStateRecovery = (extra: unknown): TurnStateRecoveryConfig => {
+  const cfg = emptyTurnStateRecovery()
+  const raw = (extra as Record<string, unknown> | undefined)?.openai_turn_state_recovery
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return cfg
+  const table = raw as Record<string, unknown>
+  cfg.enabled = table.enabled === true
+  cfg.model = typeof table.model === 'string' ? table.model : ''
+  const int = (key: string) => (typeof table[key] === 'number' ? (table[key] as number) : null)
+  cfg.streak_target = int('streak_target')
+  cfg.success_target = int('success_target')
+  cfg.min_minutes = int('min_minutes')
+  cfg.max_minutes = int('max_minutes')
+  cfg.cooldown_hours = int('cooldown_hours')
+  cfg.usage_api_key_id = int('usage_api_key_id')
+  cfg.reasoning_effort = typeof table.reasoning_effort === 'string' ? table.reasoning_effort : ''
+  return cfg
+}
+// 全空（关着、什么都没填）返回 null = 删键，与猎手同一套。
+const normalizeTurnStateRecovery = (cfg: TurnStateRecoveryConfig): Record<string, unknown> | null => {
+  const out: Record<string, unknown> = { enabled: cfg.enabled }
+  const model = cfg.model.trim()
+  if (model) out.model = model
+  const numeric: Array<[string, number | null]> = [
+    ['streak_target', cfg.streak_target],
+    ['success_target', cfg.success_target],
+    ['min_minutes', cfg.min_minutes],
+    ['max_minutes', cfg.max_minutes],
+    ['cooldown_hours', cfg.cooldown_hours],
+    ['usage_api_key_id', cfg.usage_api_key_id]
+  ]
+  for (const [key, value] of numeric) {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) out[key] = value
+  }
+  if (cfg.reasoning_effort) out.reasoning_effort = cfg.reasoning_effort
+  return !cfg.enabled && Object.keys(out).length === 1 ? null : out
+}
+const serializeTurnStateRecovery = (cfg: TurnStateRecoveryConfig) => JSON.stringify(normalizeTurnStateRecovery(cfg))
+const openAITurnStateRecovery = ref<TurnStateRecoveryConfig>(emptyTurnStateRecovery())
+
+// 探测用的思考强度档位（恢复探测的下拉）。
+// 网关池（extra.openai_gwpool / _base_url / _consumer_key）。范围与后端 IsOpenAIOAuthLike 一致：
+// 只有本地持 ChatGPT 凭据的账号才往 chatgpt.com 发推理请求。
+const accountSupportsGatewayPool = computed(
+  () => props.account?.platform === 'openai' && ['oauth', 'setup-token'].includes(props.account?.type || '')
+)
+const openAIGwpoolEnabled = ref(false)
+const openAIGwpoolBaseURL = ref('')
+// 输入框恒为空：后端把已存的 key 脱敏成 true，页面从不回显原值。留空 = 不修改。
+const openAIGwpoolConsumerKey = ref('')
+const openAIGwpoolConsumerKeySaved = ref(false)
+const openAIGwpoolResumeGateways = ref<number | ''>('')
+const openAIGwpoolContinuousWait = ref(false)
+const openAIGwpoolProbeTimeout = ref<number | ''>('')
+const openAIGwpoolPrepareRetries = ref<number | ''>('')
+// 秒数留空使用后端默认值：初始CD 1h、取票10s、清单2s。
+// 严格验证与Luna固定，不保存退役开关。
+const openAIGwpoolGatewayWindow = ref<number | null>(null)
+const gatewayPoolCooldownResetDefaultHours = 24
+const openAIGwpoolCooldownResetHours = ref<number | null>(gatewayPoolCooldownResetDefaultHours)
+const gatewayPoolCooldownResetMaxHours = 365 * 24
+const openAIGwpoolFetchTimeout = ref<number | null>(null)
+const openAIGwpoolListTimeout = ref<number | null>(null)
+const readGwpoolSeconds = (value: unknown): number | null =>
+  typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null
+
+const turnStateProbeEfforts = ['minimal', 'low', 'medium', 'high', 'xhigh']
+// 只有最终落到 ChatGPT Codex 后端的账号才做恢复探测：apikey 走的是别的上游，
+// cpr 走原样中继（出口由 codex-proxy-rs 决定，换代理换不到出口）。
+const accountSupportsTurnStateRecovery = computed(
+  () => props.account?.platform === 'openai' && ['oauth', 'setup-token'].includes(props.account?.type || '')
+)
 const readUpstreamRequestIdHeader = (extra: unknown): string => {
   const value = (extra as Record<string, unknown> | undefined)?.upstream_request_id_header
   return typeof value === 'string' ? value : ''
@@ -4025,6 +4531,8 @@ const excelBPS403GroupOptions = computed(() => [
 ])
 const copilotSDKEnabled = ref(false)
 const openaiPassthroughEnabled = ref(false)
+// 原样中继（klno，仅 OpenAI API Key）
+const openaiRawRelayEnabled = ref(false)
 // OpenAI Codex namespace 工具摊平兼容开关（仅 OAuth），缺省关闭即原样保留
 const openaiFlattenNamespacesEnabled = ref(false)
 const openAILongContextBillingEnabled = ref(false)
@@ -4043,6 +4551,9 @@ const codexCLIOnlyEnabled = ref(false)
 const codexCLIOnlyAppServerEnabled = ref(false)
 type CodexFingerprintMode = 'off' | 'device' | 'session' | 'full'
 const codexFingerprintMode = ref<CodexFingerprintMode>('off')
+// 账号级出站 User-Agent：留空表示沿用全局设置（后端 GetOpenAIUserAgent 的回落顺序）
+const codexUserAgent = ref('')
+const codexFingerprintConvergence = ref(false)
 type CodexImageToolMode = 'inherit' | 'enabled' | 'disabled' | 'block'
 const codexImageToolMode = ref<CodexImageToolMode>('inherit')
 type AnthropicAPIKeyAuthScheme = 'x_api_key' | 'authorization_bearer'
@@ -4506,6 +5017,24 @@ const syncFormFromAccount = (newAccount: Account | null) => {
 	mixedScheduling.value = extra?.mixed_scheduling === true
 	allowOverages.value = extra?.allow_overages === true
 	upstreamRequestIdHeader.value = readUpstreamRequestIdHeader(extra)
+	openAITurnStateRecovery.value = readOpenAITurnStateRecovery(extra)
+	openAIGwpoolEnabled.value = extra?.openai_gwpool === true
+	openAIUpstreamRecordingEnabled.value = newAccount.platform === 'openai' && extra?.openai_upstream_recording_enabled === true
+	openAIGwpoolBaseURL.value = typeof extra?.openai_gwpool_base_url === 'string' ? extra.openai_gwpool_base_url : ''
+	// 后端脱敏成 true = 配过；原值不会下发，所以输入框一律从空开始。
+	openAIGwpoolConsumerKeySaved.value = extra?.openai_gwpool_consumer_key === true
+	openAIGwpoolConsumerKey.value = ''
+	// 网关池强制组内轮转，阈值留空沿用后端默认。
+	openAIGwpoolResumeGateways.value = typeof extra?.openai_gwpool_resume_gateways === 'number' ? extra.openai_gwpool_resume_gateways : ''
+	openAIGwpoolContinuousWait.value = extra?.openai_gwpool_continuous_wait === true
+	openAIGwpoolProbeTimeout.value = typeof extra?.openai_gwpool_probe_timeout_s === 'number' ? extra.openai_gwpool_probe_timeout_s : ''
+	openAIGwpoolPrepareRetries.value = typeof extra?.openai_gwpool_prepare_retries === 'number' ? extra.openai_gwpool_prepare_retries : ''
+	// 续期缺省即关：只有显式 true 才算开（与后端 gatewayPoolRenew 同口径）。
+	openAIGwpoolGatewayWindow.value = readGwpoolSeconds(extra?.openai_gwpool_gateway_window_s)
+	openAIGwpoolCooldownResetHours.value = extra?.openai_gwpool_cooldown_reset_hours === 0
+    ? 0 : readGwpoolSeconds(extra?.openai_gwpool_cooldown_reset_hours) ?? gatewayPoolCooldownResetDefaultHours
+	openAIGwpoolFetchTimeout.value = readGwpoolSeconds(extra?.openai_gwpool_fetch_timeout_s)
+	openAIGwpoolListTimeout.value = readGwpoolSeconds(extra?.openai_gwpool_list_timeout_s)
 	openAIImagesUrlToB64JsonEnabled.value = extra?.images_url_to_b64_json === true
 	autoPause5hThreshold.value = typeof extra?.auto_pause_5h_threshold === 'number' ? extra.auto_pause_5h_threshold * 100 : null
 	autoPause7dThreshold.value = typeof extra?.auto_pause_7d_threshold === 'number' ? extra.auto_pause_7d_threshold * 100 : null
@@ -4539,6 +5068,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   prismBrowserModels.value = [...prismSupportedModels]
   copilotSDKEnabled.value = false
   openaiPassthroughEnabled.value = false
+  openaiRawRelayEnabled.value = false
   openaiFlattenNamespacesEnabled.value = false
   openAILongContextBillingEnabled.value = false
   editPlanType.value = ''
@@ -4552,11 +5082,13 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   codexCLIOnlyEnabled.value = false
   codexCLIOnlyAppServerEnabled.value = false
   codexFingerprintMode.value = 'off'
+  codexFingerprintConvergence.value = false
+  codexUserAgent.value = ''
   codexImageToolMode.value = 'inherit'
   anthropicPassthroughEnabled.value = false
   anthropicAPIKeyAuthScheme.value = 'x_api_key'
   webSearchEmulationMode.value = 'default'
-  if (newAccount.platform === 'openai' && (newAccount.type === 'oauth' || newAccount.type === 'setup-token' || newAccount.type === 'apikey')) {
+  if (hasOpenAIExtraSettings(newAccount)) {
     prismBrowserEnabled.value = newAccount.type === 'oauth' && extra?.openai_prism_browser === true
     if (Object.prototype.hasOwnProperty.call(extra ?? {}, 'openai_prism_browser_models')) {
       prismBrowserModels.value = Array.isArray(extra?.openai_prism_browser_models)
@@ -4584,6 +5116,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
     excelBPS403TargetGroupID.value = typeof targetGroupID === 'number' && Number.isSafeInteger(targetGroupID) && targetGroupID >= 0 ? targetGroupID : ''
     copilotSDKEnabled.value = newAccount.type === 'apikey' && extra?.openai_copilot_sdk === true
     openaiPassthroughEnabled.value = extra?.openai_passthrough === true || extra?.openai_oauth_passthrough === true
+    openaiRawRelayEnabled.value = newAccount.type === 'apikey' && extra?.openai_raw_relay === true
     openaiFlattenNamespacesEnabled.value =
       newAccount.type === 'oauth' && extra?.openai_responses_flatten_namespaces === true
     const longContextBillingValue = extra?.openai_long_context_billing_enabled
@@ -4636,6 +5169,8 @@ const syncFormFromAccount = (newAccount: Account | null) => {
       codexFingerprintMode.value = (['off', 'device', 'session', 'full'].includes(fpMode || '')
         ? fpMode as CodexFingerprintMode
         : 'off')
+      codexFingerprintConvergence.value = extra?.codex_experimental_fingerprint_convergence === true
+      codexUserAgent.value = typeof extra?.codex_user_agent === 'string' ? extra.codex_user_agent : ''
     }
     const credentials = newAccount.credentials as Record<string, unknown> | undefined
     const compactMappings = credentials?.compact_model_mapping as Record<string, string> | undefined
@@ -4902,6 +5437,17 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   } else if (newAccount.type === 'upstream' && newAccount.credentials) {
     const credentials = newAccount.credentials as Record<string, unknown>
     editBaseUrl.value = (credentials.base_url as string) || ''
+  } else if (newAccount.type === 'cpr' && newAccount.credentials) {
+    const credentials = newAccount.credentials as Record<string, unknown>
+    editCprBaseUrl.value = (credentials.base_url as string) || ''
+    editCprAccountId.value = (credentials.cpr_account_id as string) || ''
+    editCprAdminBaseUrl.value = (credentials.admin_base_url as string) || ''
+    // 两把密钥不回显。
+    editCprClientKey.value = ''
+    editCprAdminApiKey.value = ''
+    // 模型白名单/映射与 oauth 同源：后端 GetModelMapping() / IsModelSupported()
+    // 只读 credentials.model_mapping，与账号类型无关。
+    loadModelRestrictionFromMapping(credentials.model_mapping as Record<string, unknown> | undefined)
   } else if ((newAccount.platform === 'gemini' || newAccount.platform === 'anthropic') && newAccount.type === 'service_account' && newAccount.credentials) {
     const credentials = newAccount.credentials as Record<string, unknown>
     editVertexProjectId.value = (credentials.project_id as string) || ''
@@ -5730,6 +6276,31 @@ const handleSubmit = async () => {
       }
 
       updatePayload.credentials = newCredentials
+    } else if (props.account.type === 'cpr') {
+      const currentCredentials = (props.account.credentials as Record<string, unknown>) || {}
+      const newCredentials: Record<string, unknown> = { ...currentCredentials }
+
+      newCredentials.base_url = editCprBaseUrl.value.trim().replace(/\/+$/, '')
+      newCredentials.cpr_account_id = editCprAccountId.value.trim()
+      if (editCprAdminBaseUrl.value.trim()) {
+        newCredentials.admin_base_url = editCprAdminBaseUrl.value.trim().replace(/\/+$/, '')
+      } else {
+        delete newCredentials.admin_base_url
+      }
+      // 留空 = 保持原值，避免清空后无法恢复。
+      if (editCprClientKey.value.trim()) {
+        newCredentials.api_key = editCprClientKey.value.trim()
+      }
+      if (editCprAdminApiKey.value.trim()) {
+        newCredentials.admin_api_key = editCprAdminApiKey.value.trim()
+      }
+
+      applyAccountSchedulingThresholdOverridePatch(newCredentials, currentCredentials)
+      if (!applyTempUnschedConfig(newCredentials)) {
+        return
+      }
+
+      updatePayload.credentials = newCredentials
     } else if (props.account.type === 'upstream') {
       const currentCredentials = (props.account.credentials as Record<string, unknown>) || {}
       const newCredentials: Record<string, unknown> = { ...currentCredentials }
@@ -5871,7 +6442,11 @@ const handleSubmit = async () => {
     }
 
     // OpenAI/Grok OAuth: persist model mapping to credentials
-    if ((props.account.platform === 'openai' || props.account.platform === 'grok') && props.account.type === 'oauth') {
+    if (
+      ((props.account.platform === 'openai' || props.account.platform === 'grok') &&
+        props.account.type === 'oauth') ||
+      (props.account.platform === 'openai' && props.account.type === 'cpr')
+    ) {
       const currentCredentials = isSparkShadow.value
         ? {}
         : (updatePayload.credentials as Record<string, unknown>) ||
@@ -6097,7 +6672,7 @@ const handleSubmit = async () => {
     }
 
     // For OpenAI OAuth/SetupToken/API Key accounts, handle passthrough mode in extra
-    if (props.account.platform === 'openai' && (props.account.type === 'oauth' || props.account.type === 'setup-token' || props.account.type === 'apikey')) {
+    if (hasOpenAIExtraSettings(props.account)) {
       const currentExtra = (props.account.extra as Record<string, unknown>) || {}
       const newExtra: Record<string, unknown> = { ...currentExtra }
       if (props.account.type === 'oauth') {
@@ -6202,12 +6777,100 @@ const handleSubmit = async () => {
         delete newExtra.openai_passthrough
         delete newExtra.openai_oauth_passthrough
       }
-      // 缺省即保留 namespace，不写空值，避免 extra 里堆积默认项
+      if (props.account.type === 'apikey') {
+        if (openaiRawRelayEnabled.value) {
+          newExtra.openai_raw_relay = true
+        } else {
+          delete newExtra.openai_raw_relay
+        }
+      }
+      // 缺省即保留 namespace，不写空值，避免 extra 里堆积默认项。
+      // cpr 不在此处落键也不清键：这个开关没有对应 UI（表单 ref 恒为默认值），
+      // 而后端 shouldFlattenOpenAIResponsesNamespaces 对 cpr 同样生效——若某个
+      // cpr 账号经 API 设过该键，这里一律 delete 就会在保存时把它静默抹掉。
+      // （上面两个 WS 旧键对 cpr 无意义：后端对 cpr 的 WS 硬 false，照常清理。）
       if (props.account.type === 'oauth' && openaiFlattenNamespacesEnabled.value) {
         newExtra.openai_responses_flatten_namespaces = true
-      } else {
+      } else if (props.account.type !== 'cpr') {
         delete newExtra.openai_responses_flatten_namespaces
       }
+      if (accountSupportsGatewayPool.value) {
+        if (openAIGwpoolEnabled.value) {
+          newExtra.openai_gwpool = true
+        } else {
+          delete newExtra.openai_gwpool
+        }
+        const gwpoolBaseURL = openAIGwpoolBaseURL.value.trim()
+        if (gwpoolBaseURL) {
+          newExtra.openai_gwpool_base_url = gwpoolBaseURL
+        } else {
+          delete newExtra.openai_gwpool_base_url
+        }
+        // 只在真的填了新值时写。留空时 newExtra 里还带着后端脱敏下发的 true，后端按「别动」处理；
+        // 这里 delete 就会把凭据抹掉，所以**绝不能**走 else 分支。
+        const gwpoolConsumerKey = openAIGwpoolConsumerKey.value.trim()
+        if (gwpoolConsumerKey) {
+          newExtra.openai_gwpool_consumer_key = gwpoolConsumerKey
+        }
+        // 这两个键 2026-10-02 删掉了（覆写范围恒为推理面；续期只会把票换到同大区的另一个
+        // 网关）。保存时顺手清掉老账号 extra 里的残留，别让一个没人读的键留在库里。
+        delete newExtra.openai_gwpool_all_models
+        delete newExtra.openai_gwpool_renew
+        // 选票始终优先冷却完毕，清除已废弃的关闭开关。
+        delete newExtra.openai_gwpool_steering
+        delete newExtra.openai_gwpool_auto_wait
+        delete newExtra.openai_gwpool_warm_tickets
+        delete newExtra.openai_gwpool_max_wait_s
+        if (openAIGwpoolEnabled.value && openAIGwpoolContinuousWait.value) {
+          newExtra.openai_gwpool_continuous_wait = true
+        } else {
+          delete newExtra.openai_gwpool_continuous_wait
+        }
+        for (const [key, value] of [
+          ['openai_gwpool_probe_timeout_s', openAIGwpoolProbeTimeout.value],
+          ['openai_gwpool_prepare_retries', openAIGwpoolPrepareRetries.value]
+        ] as const) {
+          if (openAIGwpoolEnabled.value && value !== '') newExtra[key] = value
+          else delete newExtra[key]
+        }
+        delete newExtra.openai_gwpool_use_recommended_cooldown
+        delete newExtra.openai_gwpool_member_isolation
+        delete newExtra.openai_gwpool_early_probe_enabled
+        delete newExtra.openai_gwpool_early_probe_state
+        // 后台预热已移除，保存时清理旧键。
+        delete newExtra.openai_gwpool_prewarm
+        delete newExtra.openai_gwpool_rotation
+        delete newExtra.openai_gwpool_rotation_min_gateways
+        if (openAIGwpoolEnabled.value && openAIGwpoolResumeGateways.value !== '') {
+          newExtra.openai_gwpool_resume_gateways = openAIGwpoolResumeGateways.value
+        } else {
+          delete newExtra.openai_gwpool_resume_gateways
+        }
+        // Strict verification and Luna are backend rules, not saved overrides.
+        delete newExtra.openai_gwpool_probe_model
+        delete newExtra.openai_gwpool_guard_enabled
+        delete newExtra.openai_gwpool_guard
+        delete newExtra.openai_gwpool_state_echo
+        delete newExtra.openai_gwpool_degraded_retries
+        if (openAIGwpoolEnabled.value && typeof openAIGwpoolCooldownResetHours.value === 'number') {
+          newExtra.openai_gwpool_cooldown_reset_hours = openAIGwpoolCooldownResetHours.value
+        } else {
+          delete newExtra.openai_gwpool_cooldown_reset_hours
+        }
+        // 秒值留空使用后端默认值；数值范围由服务端统一验证。
+        for (const [key, value] of [
+          ['openai_gwpool_gateway_window_s', openAIGwpoolGatewayWindow.value],
+          ['openai_gwpool_fetch_timeout_s', openAIGwpoolFetchTimeout.value],
+          ['openai_gwpool_list_timeout_s', openAIGwpoolListTimeout.value]
+        ] as const) {
+          if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+            newExtra[key] = Math.floor(value)
+          } else {
+            delete newExtra[key]
+          }
+        }
+      }
+      newExtra.openai_upstream_recording_enabled = openAIUpstreamRecordingEnabled.value
       if (isSparkShadow.value) {
         delete newExtra.openai_long_context_billing_enabled
       } else {
@@ -6309,6 +6972,19 @@ const handleSubmit = async () => {
         } else {
           delete newExtra.codex_fingerprint_mode
         }
+        // klno 实验性指纹收敛：勾选落 true，不勾删键（对应后端 codexFingerprintConvergenceEnabled）
+        if (codexFingerprintConvergence.value) {
+          newExtra.codex_experimental_fingerprint_convergence = true
+        } else {
+          delete newExtra.codex_experimental_fingerprint_convergence
+        }
+        // 账号级出站 UA：留空删键，回落到全局设置
+        const codexUA = codexUserAgent.value.trim()
+        if (codexUA) {
+          newExtra.codex_user_agent = codexUA
+        } else {
+          delete newExtra.codex_user_agent
+        }
       }
 
       updatePayload.extra = newExtra
@@ -6406,6 +7082,22 @@ const handleSubmit = async () => {
       delete costExtra.cost_multiplier_auto_sync
     }
     updatePayload.extra = costExtra
+    // 恢复探测配置：只在改动时写回。运行态键 openai_turn_state_recovery_state 由探测维护，这里不碰。
+    if (
+      accountSupportsTurnStateRecovery.value &&
+      serializeTurnStateRecovery(openAITurnStateRecovery.value) !==
+        serializeTurnStateRecovery(readOpenAITurnStateRecovery(props.account.extra))
+    ) {
+      const currentExtra = (updatePayload.extra as Record<string, unknown>) || (props.account.extra as Record<string, unknown>) || {}
+      const newExtra: Record<string, unknown> = { ...currentExtra }
+      const nextRecovery = normalizeTurnStateRecovery(openAITurnStateRecovery.value)
+      if (nextRecovery) {
+        newExtra.openai_turn_state_recovery = nextRecovery
+      } else {
+        delete newExtra.openai_turn_state_recovery
+      }
+      updatePayload.extra = newExtra
+    }
 
     const canContinue = await ensureAntigravityMixedChannelConfirmed(async () => {
       await submitUpdateAccount(accountID, updatePayload)
@@ -6416,7 +7108,16 @@ const handleSubmit = async () => {
 
     await submitUpdateAccount(accountID, updatePayload)
   } catch (error: any) {
-    appStore.showError(error.message || t('admin.accounts.failedToUpdate'))
+    // 后端带稳定 reason code 的配置错误（网关池那几条）按 i18n 命名空间取文案，
+    // 其余照旧回落后端原串。
+    appStore.showError(
+      extractI18nErrorMessage(
+        error,
+        t,
+        'admin.accounts.openai.gwpoolErrors',
+        error?.message || t('admin.accounts.failedToUpdate')
+      )
+    )
   }
 }
 

@@ -282,14 +282,14 @@ func TestPriorityOAuthQuotaScopeAndPartitions(t *testing.T) {
 	applyPriorityCandidate(cfg, &oauth, signal, time.Now())
 	applyPriorityCandidate(cfg, &api, signal, time.Now())
 	plan := openAIAccountLoadPlan{priorityScheduling: true, topK: 2, candidates: []openAIAccountCandidateScore{api, oauth}}
-	order := scheduler.buildOpenAISelectionOrder(req, plan)
+	order := scheduler.buildOpenAISelectionOrder(context.Background(), req, plan)
 	require.Equal(t, int64(1), order[0].account.ID)
 	require.Equal(t, int64(2), order[1].account.ID)
 	require.False(t, order[1].priorityAPIStandby, "BPS quota cannot suppress the native pool")
 	delete(oauth.account.Extra, "openai_excel_bps")
 	api.account.Extra["openai_compact_supported"] = true
 	req.RequireCompact = true
-	order = scheduler.buildOpenAISelectionOrder(req, plan)
+	order = scheduler.buildOpenAISelectionOrder(context.Background(), req, plan)
 	require.Equal(t, int64(2), order[0].account.ID)
 	require.False(t, order[0].priorityAPIStandby, "unknown compact OAuth cannot suppress supported API")
 }

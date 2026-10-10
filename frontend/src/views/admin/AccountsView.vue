@@ -286,11 +286,16 @@
             </div>
           </template>
           <template #cell-capacity="{ row }">
-            <AccountCapacityCell :account="row" :concurrency-upgrade-enabled="concurrencyUpgradeEnabled" />
+            <AccountCapacityCell :account="row" :concurrency-upgrade-enabled="concurrencyUpgradeEnabled" :gateway-progress="gatewayProgress[row.id]" :progress-paused="row.extra?.openai_gwpool === true && gatewayProgressPaused" />
           </template>
           <template #cell-status="{ row }">
             <div class="flex items-center gap-1.5">
-              <AccountStatusIndicator :account="row" :global-bps-enabled="appStore.cachedPublicSettings?.excel_bps_enabled !== false" @show-temp-unsched="handleShowTempUnsched" />
+              <AccountStatusIndicator :account="row"
+                :global-bps-enabled="appStore.cachedPublicSettings?.excel_bps_enabled !== false"
+                :gateway-pool-rest="gatewayProgress[row.id]?.runtime?.rest"
+                :gateway-pool-rest-pending="row.extra?.openai_gwpool === true && !gatewayProgress[row.id]?.runtime?.rest"
+                :progress-paused="row.extra?.openai_gwpool === true && gatewayProgressPaused"
+                @show-temp-unsched="handleShowTempUnsched" />
             </div>
           </template>
           <template #cell-schedulable="{ row }">
@@ -327,6 +332,17 @@
               @account-updated="handleAccountUpdated"
               @usage-loaded="handleAccountUsageLoaded(row.id, $event)"
             />
+            <AccountTurnStateCell :account="row" />
+          </template>
+          <template #header-gateway="{ column }">
+            <div class="flex items-center">
+              <span>{{ column.label }}</span>
+              <HelpTooltip :content="t('admin.accounts.gatewayColumnHint')" width-class="w-72" />
+            </div>
+          </template>
+          <template #cell-gateway="{ row }">
+            <AccountGatewayCell :account="row" :progress="gatewayProgress[row.id]" :progress-paused="row.extra?.openai_gwpool === true && gatewayProgressPaused"
+              :retry-pending="retryingGatewayAccounts.has(row.id)" @retry="retryGatewayPool" />
           </template>
           <template #cell-proxy="{ row }">
             <div class="flex flex-col gap-1">
@@ -337,6 +353,18 @@
                 </span>
               </div>
               <span v-else class="text-sm text-gray-400 dark:text-dark-500">-</span>
+              <!-- cpr 账号真正的出口在 CPR 那一层：上面那个 proxy 只作用于 sub2api→CPR
+                   这一跳（现网是 127.0.0.1），照它判断「这个号从哪出去」会得到完全错误的
+                   答案。展示前必须过 cprOutboundProxy() 剥 userinfo——CPR 现在返回的是
+                   脱敏值，但那是上游的行为、不是我们能保证的不变量，别在这里直接插值。 -->
+              <div
+                v-if="cprOutboundProxy(row)"
+                class="flex items-center gap-1 text-xs"
+                data-testid="account-cpr-outbound"
+              >
+                <span class="text-gray-500 dark:text-gray-400">{{ t('admin.accounts.cprOutbound') }}</span>
+                <span class="font-mono text-gray-700 dark:text-gray-300">{{ cprOutboundProxy(row) }}</span>
+              </div>
               <div v-if="row.proxy && row.proxy.expires_at" class="flex items-center gap-2 text-xs">
                 <span class="text-gray-600 dark:text-gray-300">{{ formatDateTime(row.proxy.expires_at) }}</span>
                 <span :class="proxyExpiryBadge(row.proxy)">{{ proxyExpiryText(row.proxy) }}</span>
@@ -528,6 +556,9 @@ import ScheduledTestsPanel from '@/components/admin/account/ScheduledTestsPanel.
 import type { SelectOption } from '@/components/common/Select.vue'
 import AccountStatusIndicator from '@/components/account/AccountStatusIndicator.vue'
 import AccountUsageCell from '@/components/account/AccountUsageCell.vue'
+import AccountGatewayCell from '@/components/account/AccountGatewayCell.vue'
+import { useGatewayPoolProgress } from '@/composables/useGatewayPoolProgress'
+import AccountTurnStateCell from '@/components/account/AccountTurnStateCell.vue'
 import AccountTodayStatsCell from '@/components/account/AccountTodayStatsCell.vue'
 import AccountGroupsCell from '@/components/account/AccountGroupsCell.vue'
 import AccountCapacityCell from '@/components/account/AccountCapacityCell.vue'
@@ -540,17 +571,31 @@ import Icon from '@/components/icons/Icon.vue'
 import ErrorPassthroughRulesModal from '@/components/admin/ErrorPassthroughRulesModal.vue'
 import TLSFingerprintProfilesModal from '@/components/admin/TLSFingerprintProfilesModal.vue'
 import { fetchAllAccountIds } from '@/utils/accountSelection'
-import { buildGrokUsageRefreshKey, buildOpenAIUsageRefreshKey } from '@/utils/accountUsageRefresh'
+import { buildGrokUsageRefreshKey, buildOpenAIUsageRefreshKey, isOpenAICodexUsageAccount } from '@/utils/accountUsageRefresh'
 import { formatDateTime, formatRelativeTime } from '@/utils/format'
 import { proxyExpiryBadgeClass, proxyExpiryLabelKey } from '@/utils/proxyExpiry'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import { sanitizeUrl } from '@/utils/url'
 import { getFloatingPanelPosition } from '@/utils/floatingPanel'
 import { formatMultiplier } from '@/utils/formatters'
+import { cprOutboundProxy } from '@/utils/turnState'
 import type { Account, AccountListItem, AccountPlatform, AccountSchedulerGroupScore, AccountType, AccountUsageInfo, Proxy as AccountProxy, AdminGroup, WindowStats, ClaudeModel, UpstreamBillingProbeSnapshot } from '@/types'
 
 const { t } = useI18n()
 const appStore = useAppStore()
+const retryingGatewayAccounts = ref(new Set<number>())
+async function retryGatewayPool(id: number) {
+  if (retryingGatewayAccounts.value.has(id)) return
+  retryingGatewayAccounts.value.add(id)
+  try {
+    const result = await adminAPI.accounts.retryGatewayPool(id)
+    appStore.showSuccess(t(`admin.accounts.openai.gwpoolManualRetryResult.${result.state}`))
+  } catch (error) {
+    appStore.showError(extractApiErrorMessage(error, t('admin.accounts.openai.gwpoolManualRetryFailed')))
+  } finally {
+    retryingGatewayAccounts.value.delete(id)
+  }
+}
 const authStore = useAuthStore()
 const concurrencyUpgradeEnabled = ref(false)
 let concurrencyUpgradeRequest = 0
@@ -772,7 +817,9 @@ const accountSupportsBatchUsage = (account: Account) => {
   }
   if (account.platform === 'gemini') return true
   if (account.platform === 'antigravity') return account.type === 'oauth'
-  if (account.platform === 'openai') return account.type === 'oauth'
+  // 漏掉 cpr 会让 queueBatchedUsage 直接 return，AccountUsageCell 在 batch
+  // 模式下把 usageInfo 置 null，表现为用量列恒为 "-"、每次刷新都得手动点一次查询。
+  if (account.platform === 'openai') return isOpenAICodexUsageAccount(account)
   if (account.platform === 'grok') return account.type === 'oauth'
   return false
 }
@@ -1126,6 +1173,12 @@ const {
     sort_order: sortState.sort_order
   }
 })
+
+const { progress: gatewayProgress, paused: gatewayProgressPaused } = useGatewayPoolProgress(computed(() =>
+  hiddenColumns.has('gateway') && hiddenColumns.has('capacity') && hiddenColumns.has('status') ? [] : accounts.value
+    .filter(account => account.extra?.openai_gwpool === true)
+    .map(account => account.id)
+))
 
 const {
   selectedSet,
@@ -1730,7 +1783,14 @@ function getAccountPlanType(row: any): string | undefined {
       row.parent_plan_type
     )
   }
-  return firstNonBlankString(row.credentials?.plan_type, row.parent_plan_type)
+  // cpr 的档位：凭据里人工写的 plan_type 优先（显式覆盖），其次是后端
+  // refreshCPRCodexSnapshot 探测落在 extra.cpr_plan_type 的值——与后端
+  // IsOpenAIChatGPTSubscription() 的回退顺序一致。只对 cpr 行读这个键。
+  return firstNonBlankString(
+    row.credentials?.plan_type,
+    row.type === 'cpr' ? (row.extra as Record<string, any> | undefined)?.cpr_plan_type : undefined,
+    row.parent_plan_type
+  )
 }
 
 function getOpenAIAuthMode(row: any): string | undefined {
@@ -1778,7 +1838,9 @@ function accountHomepageUrl(row: Account): string {
 type OpenAICompactBadgeState = 'active' | 'blocked' | 'auto'
 
 function getOpenAICompactState(row: any): OpenAICompactBadgeState | null {
-  if (row.platform !== 'openai' || (row.type !== 'oauth' && row.type !== 'apikey')) return null
+  // cpr 与 oauth/apikey 共用 openai_compact_mode，后端 GetOpenAICompactMode()
+  // 只判 IsOpenAI()。setup-token 维持原状（本次只放行 cpr）。
+  if (row.platform !== 'openai' || !['oauth', 'apikey', 'cpr'].includes(row.type)) return null
   const extra = row.extra as Record<string, unknown> | undefined
   const mode = typeof extra?.openai_compact_mode === 'string' ? extra.openai_compact_mode : 'auto'
   if (mode === 'force_on') return 'active'
@@ -1848,6 +1910,9 @@ const allColumns = computed(() => {
     c.push({ key: 'groups', label: t('admin.accounts.columns.groups'), sortable: false })
   }
   c.push({ key: 'usage', label: t('admin.accounts.columns.usageWindows'), sortable: false })
+  // 网关落点独立成列：它答的是「这个号在哪个大区还能拿到没烧过的落点」，和用量窗口
+  // （上游的滚动限额）是两件事，挤在一格里两边都读不出来。
+  c.push({ key: 'gateway', label: t('admin.accounts.columns.gateway'), sortable: false })
   c.push(
     { key: 'proxy', label: t('admin.accounts.columns.proxy'), sortable: false },
     { key: 'priority', label: t('admin.accounts.columns.priority'), sortable: true },

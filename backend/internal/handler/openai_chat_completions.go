@@ -21,6 +21,7 @@ import (
 // ChatCompletions handles OpenAI Chat Completions API requests.
 // POST /v1/chat/completions
 func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
+	defer service.FinishGatewayPoolWaitKeepalive(c)
 	streamStarted := false
 	defer h.recoverResponsesPanic(c, &streamStarted)
 
@@ -261,13 +262,16 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		if channelMapping.Mapped {
 			forwardBody = h.gatewayService.ReplaceModelInBody(body, channelMapping.MappedModel)
 		}
-		writerSizeBeforeForward := c.Writer.Size()
+		writerSizeBeforeForward := service.OpenAICompactKeepaliveAdjustedWrittenSize(c)
 		result, err := func() (*service.OpenAIForwardResult, error) {
 			defer func() {
 				if accountReleaseFunc != nil {
 					accountReleaseFunc()
 				}
 			}()
+			if failure := service.GatewayPoolRetryFailure(c.Request.Context()); failure != nil {
+				return nil, failure
+			}
 			return h.gatewayService.ForwardAsChatCompletions(rpmAdmission.forwardContext(c.Request.Context(), account), c, account, forwardBody, promptCacheKey, "")
 		}()
 		if retryOpenAIInitialAdmission(c, err, result, body, account.ID, failedAccountIDs, &switchCount, maxAccountSwitches) {
@@ -307,6 +311,8 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			upstreamEndpoint := resolveOpenAIUpstreamEndpoint(c, account, res)
 			quotaPlatform := service.QuotaPlatform(c.Request.Context(), apiKey)
 			sessionID := service.ExtractClientSessionID(c)
+			turnStateSource := service.OpenAITurnStateUsageSource(c)
+			turnStateSent := service.OpenAITurnStateUsageSent(c)
 			cyberBlocked := service.GetOpsCyberPolicy(c) != nil
 			h.submitOpenAIUsageRecordTask(c.Request.Context(), res, func(ctx context.Context) {
 				if err := h.gatewayService.RecordUsage(ctx, &service.OpenAIRecordUsageInput{
@@ -322,6 +328,8 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 					APIKeyService:      h.apiKeyService,
 					QuotaPlatform:      quotaPlatform,
 					SessionID:          sessionID,
+					TurnStateSource:    turnStateSource,
+					TurnStateSent:      turnStateSent,
 					ChannelUsageFields: clientRequestedUsageFields(c, channelMapping, reqModel, res.UpstreamModel),
 					PricingAt:          pricingAt,
 					CyberBlocked:       cyberBlocked,
@@ -358,7 +366,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 						)
 						return
 					}
-					if c.Writer.Size() != writerSizeBeforeForward {
+					if service.OpenAICompactKeepaliveAdjustedWrittenSize(c) != writerSizeBeforeForward {
 						h.gatewayService.ObserveOpenAIAccountHealthFailure(c.Request.Context(), account, err)
 						h.handleFailoverExhausted(c, failoverErr, true)
 						return
@@ -366,7 +374,9 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 					if failoverErr.ShouldReportAccountScheduleFailure() {
 						h.gatewayService.ReportOpenAIAccountScheduleResult(account, openAIAccountScheduleModel(c, account, reqModel, false, nil), false, nil, err)
 					}
-					if !forbiddenBudget.canRetry(failoverErr, switchCount) {
+					c.Request = c.Request.WithContext(h.gatewayService.PrepareGatewayPoolAccountRotation(c.Request.Context(), apiKey.GroupID, account, failoverErr, c))
+					// gwpool「仅同号重试」先放行到同号重试分支；换号前仍由下方 forbiddenBudget 把关（canRetry 内含 ShouldRetryNextAccount）。
+					if !failoverErr.SameAccountRetryOnly && !forbiddenBudget.canRetry(failoverErr, switchCount) {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}
@@ -388,8 +398,16 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 								return
 							case <-time.After(retryDelay):
 							}
+							if !sameAccountRetryDeadlineAllows(failoverErr) {
+								h.handleFailoverExhausted(c, failoverErr, streamStarted)
+								return
+							}
 							continue
 						}
+					}
+					if !forbiddenBudget.canRetry(failoverErr, switchCount) {
+						h.handleFailoverExhausted(c, failoverErr, streamStarted)
+						return
 					}
 					h.gatewayService.RecordOpenAIAccountSwitch()
 					failedAccountIDs[account.ID] = struct{}{}

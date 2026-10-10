@@ -209,3 +209,5 @@ issues/
 !docs/screenshots/2fa-rotation/
 **/totp-recovery/
 **/*.sealed
+# Python unit-test orchestration cache
+/tools/__pycache__/

@@ -216,8 +216,13 @@ func (h *OpenAIOAuthHandler) RefreshToken(c *gin.Context) {
 
 	var proxyURL string
 	if req.ProxyID != nil {
+		// 绑了代理却查不到就失败，不退回直连（与 PAT 导入同口径）。
 		proxy, err := h.adminService.GetProxy(c.Request.Context(), *req.ProxyID)
-		if err == nil && proxy != nil {
+		if err != nil {
+			response.ErrorFrom(c, err)
+			return
+		}
+		if proxy != nil {
 			proxyURL = proxy.URL()
 		}
 	}

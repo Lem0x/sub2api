@@ -3,12 +3,15 @@ package service
 import (
 	"context"
 	"errors"
+	"math"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/gwpool"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -67,6 +70,14 @@ var persistentUpstreamTransportErrorMarkers = []string{
 //     net even though the typed checks should cover them on modern Go+Linux.
 func classifyUpstreamTransportError(err error) upstreamTransportErrorClass {
 	if err == nil {
+		return upstreamTransportErrorClass{}
+	}
+
+	// 网关池这一侧的失败不是这个账号的代理/网络故障：重启池子、改端口、容器没起都是日常操作，
+	// 而它们的报错字面（connection refused / no such host）和真实代理死掉一模一样，照字符串判就会
+	// 把一批真账号按「代理持久故障」停调度 10 分钟并发告警。失败仍然 failover、仍然记 Ops 错误，
+	// 只是不摘账号（openai_gwpool.go / pkg/gwpool）。
+	if errors.Is(err, gwpool.ErrPool) || errors.Is(err, ErrGatewayPoolWSIncompatible) {
 		return upstreamTransportErrorClass{}
 	}
 
@@ -130,6 +141,10 @@ func (s *OpenAIGatewayService) handleOpenAIUpstreamTransportError(ctx context.Co
 	if isClientCanceledTransportError(ctx, err) {
 		return err
 	}
+	var rejectedRetry *UpstreamFailoverError
+	if errors.As(err, &rejectedRetry) {
+		return rejectedRetry // pre-dispatch retry expiry is not a transport/account fault
+	}
 	safeErr := sanitizeUpstreamErrorMessage(err.Error())
 	setOpsUpstreamError(c, 0, safeErr, "")
 	proxyID, proxyName := runtimeProxyErrorAttribution(account, err)
@@ -167,10 +182,39 @@ func (s *OpenAIGatewayService) handleOpenAIUpstreamTransportError(ctx context.Co
 		s.tempUnscheduleOpenAITransportError(ctx, account, safeErr)
 	}
 
-	return &UpstreamFailoverError{
+	out := &UpstreamFailoverError{
 		StatusCode:   http.StatusBadGateway,
 		ResponseBody: openAITransportFailoverBody,
 	}
+	// 路由质量失败不能交给通用换号重试。池专属恢复层在未交付且确证耗尽后，
+	// 再按本地候选/休息规则决定后续动作，避免通用重试放大验票请求。
+	if errors.Is(err, errOpenAIGatewayPoolRouteDegraded) ||
+		errors.Is(err, errOpenAIGatewayPoolWarmExhausted) {
+		out.NextAccountAction = NextAccountStop
+	}
+	// 把池子那三条双语说明交到客户端手里。不填的话 handler 的分支全不命中，最后落到
+	// mapUpstreamError(502) 的通用文案「Upstream request failed」——而「池子没票，等会儿
+	// 再试」和「池子地址配错了，去改配置」对使用者要做的事完全相反。
+	// Reason 同时让 ShouldReportAccountScheduleFailure 放过这个账号：池子挂了不是它的错，
+	// 与 classifyUpstreamTransportError 对 gwpool.ErrPool 的豁免同一个道理。
+	if msg := gatewayPoolClientMessage(err); msg != "" {
+		out.Reason = OpenAIGatewayPoolReason
+		out.GatewayPoolRotation = gatewayPoolRotationFailure(err)
+		// Pool-specific rotation is opt-in for both ends. Only the handler,
+		// after checking replay safety and fresh source settings, can reopen it.
+		out.NextAccountAction = NextAccountStop
+		out.ClientMessage = msg
+		out.ClientStatusCode = http.StatusServiceUnavailable
+		// 带上 Retry-After：handler 的 copyFailoverRetryAfter 从 ResponseHeaders 里取它。
+		// 池子这边的失败都是秒级返回的 503，而 Codex CLI 对 503 立刻重发 ⇒ 不报这个数就是
+		// 一个纯热循环，每一轮还可能再烧几张票（见 gatewayPoolRetryAfter 的现场数据）。
+		if retry := gatewayPoolRetryAfter(err); retry > 0 {
+			out.ResponseHeaders = http.Header{
+				"Retry-After": []string{strconv.Itoa(int(math.Ceil(retry.Seconds())))},
+			}
+		}
+	}
+	return out
 }
 
 // tempUnscheduleOpenAITransportError marks an account temporarily unschedulable

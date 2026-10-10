@@ -416,6 +416,7 @@ describe('UseKeyModal', () => {
     expect(configToml).not.toContain('supports_websockets')
     expect(configToml).not.toContain('responses_websockets_v2')
     const features = configToml?.split('[features]\n')[1]?.split('\n[')[0]
+    expect(features).toContain('api_key_model_discovery = true')
     expect(features).toContain('goals = true')
     expect(features).toContain('api_key_model_discovery = true')
     expect(configToml).not.toContain('model_reasoning_effort = "xhigh"')
@@ -561,6 +562,7 @@ describe('UseKeyModal', () => {
     expect(configToml).not.toContain('image_generation')
     expect(configToml).toContain('supports_websockets = true')
     const features = configToml?.split('[features]\n')[1]?.split('\n[')[0]
+    expect(features).toContain('api_key_model_discovery = true')
     expect(features).toContain('responses_websockets_v2 = true')
     expect(features).toContain('goals = true')
     expect(features).toContain('api_key_model_discovery = true')
@@ -613,6 +615,7 @@ describe('UseKeyModal', () => {
     expect(configToml).not.toContain('image_generation')
     expect(configToml).toContain('supports_websockets = true')
     const features = configToml?.split('[features]\n')[1]?.split('\n[')[0]
+    expect(features).toContain('api_key_model_discovery = true')
     expect(features).toContain('responses_websockets_v2 = true')
     expect(features).toContain('goals = true')
     expect(features).toContain('api_key_model_discovery = true')
@@ -1085,7 +1088,7 @@ describe('UseKeyModal', () => {
         expect(configToml).toContain('model = "gpt-5.5"')
         expect(configToml).toContain('[model_providers.OpenAI]\nname = "OpenAI"\nbase_url = "https://example.com/v1"\nmodel_catalog_url = "https://example.com/v1/models"')
         expect(configToml).not.toContain('model_catalog_json')
-        expect(configToml).toContain('[features]\napi_key_model_discovery = true')
+        expect(configToml).toContain('[features]\napi_key_model_discovery = true\n')
         expect(configToml).toContain('requires_openai_auth = true')
         expect(configToml).not.toContain('client_version')
         expect(wrapper.find('[data-testid="codex-model-catalog"]').exists()).toBe(true)

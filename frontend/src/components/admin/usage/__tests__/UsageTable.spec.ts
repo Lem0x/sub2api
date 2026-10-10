@@ -15,6 +15,7 @@ vi.mock('@/stores/app', () => ({ useAppStore: () => appStoreMocks }))
 
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { mount } from '@vue/test-utils'
+import { turnStateFixture } from '@/components/account/__tests__/turnStateFixture'
 import { nextTick } from 'vue'
 
 import en from '@/i18n/locales/en/admin/resources'
@@ -35,7 +36,23 @@ const localizedMessages: Record<'en' | 'zh', Record<string, string>> = {
 
 const messages: Record<string, string> = {
   'usage.latencyTps': 'Avg TPS',
+  'usage.outputTps': 'Output TPS',
+  'admin.usage.turnStateBlocks': 'blocks:{n}',
+  'admin.usage.turnStateSourceShort.manual': 'BADGE-MAN',
+  'admin.usage.turnStateSourceShort.auto': 'BADGE-AUTO',
+  'admin.usage.turnStateSourceShort.auto_stale': 'BADGE-AUTOSTALE',
+  'admin.usage.turnStateSourceLong.manual': 'long.manual',
+  'admin.usage.turnStateSourceLong.auto': 'long.auto',
+  'admin.usage.turnStateSourceLong.auto_stale': 'long.auto_stale',
   'admin.usage.userDeletedBadge': 'Deleted',
+  'admin.usage.turnStateOverriddenShort': 'OVR',
+  'admin.usage.routePairOverriddenShort': 'POOL',
+  'admin.usage.routePairOverridden': 'Pair came from the gateway pool',
+  'admin.usage.routePairReroutedShort': 'REROUTED',
+  'admin.usage.routePairRerouted': 'Pool promised {promised}, upstream landed {landed}',
+  'admin.usage.routePairPoolVersion': 'Pool ticket id',
+  'admin.usage.turnStateOverridden': 'Override active',
+  'admin.usage.turnStateCopied': 'Turn-state copied',
   'usage.costDetails': 'Cost Breakdown',
   'admin.usage.inputCost': 'Input Cost',
   'admin.usage.outputCost': 'Output Cost',
@@ -94,7 +111,11 @@ vi.mock('vue-i18n', async () => {
   return {
     ...actual,
     useI18n: () => ({
-      t: (key: string) => localizedMessages[locale][key] ?? messages[key] ?? key,
+      t: (key: string, params?: Record<string, unknown>) => {
+        const raw = localizedMessages[locale][key] ?? messages[key] ?? key
+        if (!params) return raw
+        return raw.replace(/\{(\w+)\}/g, (m, k) => (k in params ? String(params[k]) : m))
+      },
     }),
   }
 })
@@ -105,6 +126,7 @@ const DataTableStub = {
     <div>
       <div v-for="row in data" :key="row.request_id" :data-request-id="row.request_id">
         <slot name="cell-model" :row="row" :value="row.model" />
+        <slot name="cell-turn_state_sent" :row="row" :value="row.turn_state_sent" />
         <slot name="cell-reasoning_effort" :row="row" :value="row.reasoning_effort" />
         <slot name="cell-billing_mode" :row="row" />
         <slot name="cell-tokens" :row="row" />
@@ -112,6 +134,8 @@ const DataTableStub = {
         <slot name="cell-cost" :row="row" />
         <slot name="cell-request_id" :row="row" />
         <slot name="cell-upstream_request_id" :row="row" />
+        <slot name="cell-turn_state" :row="row" />
+        <slot name="cell-route_gateway" :row="row" />
       </div>
     </div>
   `,
@@ -146,18 +170,61 @@ const baseImageRow = {
 }
 
 describe('admin UsageTable tooltip', () => {
-  it('shows output TPS in the latency cell using total duration', () => {
-    const row = { ...baseImageRow, image_count: 0, billing_mode: 'token', output_tokens: 1000, duration_ms: 20_000, first_token_ms: 10_000 }
+  it('shows sync TPS using total duration, with missing and image data unavailable', () => {
+    const row = { ...baseImageRow, request_type: 'sync', stream: false, image_count: 0, billing_mode: 'token', output_tokens: 1000, duration_ms: 20_000, first_token_ms: 10_000 }
     const wrapper = mount(UsageTable, {
       props: {
-        data: [row, { ...row, request_id: 'no-duration', duration_ms: null }, { ...row, request_id: 'image', image_count: 1 }],
+        data: [
+          row,
+          { ...row, request_id: 'no-duration', duration_ms: null },
+          { ...row, request_id: 'image', image_count: 1 },
+          { ...row, request_id: 'image-tokens', image_output_tokens: 10 },
+        ],
         loading: false,
         columns: [{ key: 'latency', label: 'Latency' }],
       },
       global: { stubs: { DataTable: DataTableStub, EmptyState: true, Icon: true, Teleport: true } },
     })
-    expect(wrapper.findAll('[data-testid="latency-tps"]').map(cell => cell.text())).toEqual(['50.0 t/s', '-', '-'])
+    expect(wrapper.findAll('[data-testid="latency-tps"]').map(cell => cell.text())).toEqual(['50.0 t/s', '-', '-', '-'])
     expect(wrapper.text()).toContain('Avg TPS')
+    expect(wrapper.findAll('[data-testid="usage-tps"]').map(cell => cell.text())).toEqual(['50.00', '—', '—', '—'])
+    expect(wrapper.text()).toContain('TPS')
+    wrapper.unmount()
+  })
+
+  it('shows aligned TPS as the third latency row in both usage views', () => {
+    for (const showAccountBilling of [true, false]) {
+      const wrapper = mount(UsageTable, {
+        props: {
+          data: [{
+            ...baseImageRow,
+            billing_mode: 'token',
+            image_count: 0,
+            output_tokens: 100,
+            request_type: 'stream',
+            stream: true,
+            duration_ms: 7000,
+            first_token_ms: 2000,
+          }],
+          columns: [],
+          showAccountBilling,
+        },
+        global: { stubs: { DataTable: DataTableStub, EmptyState: true, Icon: true, Teleport: true } },
+      })
+      const tps = wrapper.get('[data-testid="usage-tps"]')
+      expect(tps.text()).toBe('20.00')
+      expect(tps.attributes('title')).toBe('usage.tpsDescription')
+      expect(tps.element.parentElement!.classList.contains('text-left')).toBe(true)
+      const cells = Array.from(tps.element.parentElement!.children)
+      expect(cells).toHaveLength(8)
+      expect(cells[6].textContent).toBe('TPS')
+      expect(cells[6].getAttribute('title')).toBe('usage.tpsDescription')
+      for (const index of [1, 3, 5, 7]) {
+        expect(cells[index].classList.contains('text-right')).toBe(true)
+        expect(cells[index].classList.contains('tabular-nums')).toBe(true)
+      }
+      wrapper.unmount()
+    }
   })
 
   beforeEach(() => {
@@ -755,6 +822,112 @@ describe('admin UsageTable request ID column', () => {
     expect(writeText).toHaveBeenCalledWith('20260903082826779695')
     expect(appStoreMocks.showSuccess).toHaveBeenCalledWith('Upstream ID copied')
   })
+
+  // 判据是密文块数，不是字符长度。样本必须是真 Fernet 信封——假字符串首字节不是
+  // 0x80，decodeTurnState 会返回 null，就只测到了「退回字符长度」的兜底分支。
+  const mountTurnState = (row: Record<string, unknown>) =>
+    mount(UsageTable, {
+      props: {
+        data: [{ ...baseImageRow, request_id: '', upstream_request_id: '', ...row }],
+        loading: false,
+        columns: [{ key: 'turn_state', label: 'Turn-state' }],
+      },
+      global: { stubs: { DataTable: DataTableStub, EmptyState: true, Icon: true, Teleport: true } },
+    })
+
+  it.each([
+    [10, 292, true],
+    [11, 312, false],
+  ])('badges a %i-block (%i-char) turn-state as green=%s', async (blocks, len, green) => {
+    const blob = turnStateFixture(1789651097, blocks)
+    expect(blob).toHaveLength(len)
+
+    const wrapper = mountTurnState({ turn_state: blob })
+    const badge = wrapper.findAll('span').find((n) => n.text() === String(len))
+    expect(badge, '徽标必须显示字符长度（292/312），块数只作判据').toBeTruthy()
+    expect(badge!.classes().some((c) => c.includes('green'))).toBe(green)
+    // 非健康必须是红色告警，不能退回中性灰——徽标语义就是「一眼看出降智」。
+    expect(badge!.classes().some((c) => c.includes('red'))).toBe(!green)
+    // 徽标文本现在只是字符长度，真信封与 'g'.repeat(292) 产出完全一样的文本和颜色。
+    // 这道断言是全套测试里唯一还依赖 decodeTurnState 返回值的闸：把它改成 return null
+    // 整套就会退回长度兜底而照样绿——这个仓库以前正是这么踩过的。
+    expect(badge!.attributes('title')).toContain('turnStateHint')
+  })
+
+  it('表外形态（780 / 33 块）标黄，不冒充降智的红', async () => {
+    const blob = turnStateFixture(1789651097, 33)
+    expect(blob).toHaveLength(780)
+
+    const wrapper = mountTurnState({ turn_state: blob })
+    const badge = wrapper.findAll('span').find((n) => n.text() === '780')
+    expect(badge).toBeTruthy()
+    expect(badge!.classes()).toContain('bg-yellow-100')
+    expect(badge!.classes().some((c) => c.includes('red') || c.includes('green'))).toBe(false)
+    expect(badge!.attributes('title')).toContain('turnStateUnknownShape')
+  })
+
+  it('解不出信封时退回字符长度（老判据）', async () => {
+    const wrapper = mountTurnState({ turn_state: 'g'.repeat(292) })
+    const badge = wrapper.findAll('span').find((n) => n.text() === '292')
+    expect(badge).toBeTruthy()
+    expect(badge!.classes().some((c) => c.includes('green'))).toBe(true)
+    expect(badge!.attributes('title')).toContain('turnStateUndecodable')
+  })
+
+  it.each([
+    ['manual', 'BADGE-MAN'],
+    ['auto', 'BADGE-AUTO'],
+    ['auto_stale', 'BADGE-AUTOSTALE'],
+  ])('覆写来源 %s 渲染成本地化徽标而不是后端枚举', async (source, label) => {
+    // 来源徽标贴在出站列：它说的是出站那张票从哪来。贴在铸出列时「注入 292 后上游仍铸
+    // 312」会显示成「312 手填」，像是手填的就是 312。
+    const sent = turnStateFixture(1789651097, 10)
+    const minted = turnStateFixture(1789651098, 11)
+    const wrapper = mount(UsageTable, {
+      props: {
+        data: [{
+          ...baseImageRow,
+          request_id: '',
+          upstream_request_id: '',
+          turn_state: minted,
+          turn_state_sent: sent,
+          turn_state_overridden: true,
+          turn_state_source: source,
+        }],
+        loading: false,
+        columns: [{ key: 'turn_state', label: 'Turn-state' }, { key: 'turn_state_sent', label: 'Sent' }],
+      },
+      global: { stubs: { DataTable: DataTableStub, EmptyState: true, Icon: true, Teleport: true } },
+    })
+    expect(wrapper.text()).toContain(label)
+    expect(wrapper.text()).not.toContain(source)
+    const badge = wrapper.findAll('span').find((n) => n.text() === label)!
+    expect(badge.element.parentElement?.textContent).toContain(sent)
+    expect(badge.element.parentElement?.textContent).not.toContain(minted)
+  })
+
+  it('copies the turn-state with its own toast', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    vi.stubGlobal('navigator', { clipboard: { writeText } })
+    const blob = 'gAAAAAB-turn-state'
+
+    const wrapper = mount(UsageTable, {
+      props: {
+        data: [{ ...baseImageRow, request_id: '', upstream_request_id: '', turn_state: blob }],
+        loading: false,
+        columns: [{ key: 'turn_state', label: 'Turn-state' }],
+      },
+      global: { stubs: { DataTable: DataTableStub, EmptyState: true, Icon: true, Teleport: true } },
+    })
+
+    const copyButtons = wrapper.findAll('button[title="Copy to clipboard"]')
+    expect(copyButtons).toHaveLength(1)
+    await copyButtons[0].trigger('click')
+
+    expect(writeText).toHaveBeenCalledWith(blob)
+    // 复用上游ID的文案会弹错提示，这里钉住专属文案
+    expect(appStoreMocks.showSuccess).toHaveBeenCalledWith('Turn-state copied')
+  })
 })
 
 describe('admin UsageTable IP geolocation batch toolbar', () => {
@@ -941,6 +1114,81 @@ describe('admin UsageTable deleted-user badge', () => {
 
     expect(wrapper.text()).not.toContain('Deleted')
     expect(wrapper.text()).toContain('active@test.com')
+  })
+
+  // safety_buffering_* 两列只落库不展示（用户 2026-09-25 定）：faster-model 是客户端「换更快模型重试」
+  // 的备选，不是路由结果，显示出来会被读成错误路由。
+  it('does not render the upstream safety-buffering headers under the model cell', () => {
+    const wrapper = mount(UsageTable, {
+      props: {
+        data: [{
+          request_id: 'req-safety-buffering',
+          model: 'gpt-6-astra',
+          safety_buffering_enabled: true,
+          safety_buffering_faster_model: 'gpt-5.6-luna',
+        }],
+        loading: false,
+        columns: [],
+      },
+      global: { stubs: { DataTable: DataTableStub, EmptyState: true, Icon: true, Teleport: true } },
+    })
+    expect(wrapper.find('[data-testid="safety-buffering-marker"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('gpt-5.6-luna')
+    expect(wrapper.text()).not.toContain('enabled=')
+  })
+  // 网关池覆写徽标：挂在默认可见的模型列（route_gateway 列默认隐藏），只给网关名与状态，
+  // cookie 本体仍只在 route_gateway 列的复制按钮里。
+  const mountGwpoolRow = (row: Record<string, unknown>) =>
+    mount(UsageTable, {
+      props: {
+        data: [{ request_id: 'req-gwpool', model: 'gpt-6-astra', ...row }],
+        loading: false,
+        columns: [{ key: 'model', label: 'Model' }],
+      },
+      global: { stubs: { DataTable: DataTableStub, EmptyState: true, Icon: true, Teleport: true } },
+    })
+
+  it('marks the row as applied when the pool gateway equals the landing gateway', () => {
+    const wrapper = mountGwpoolRow({
+      route_gateway: 'unified-142',
+      route_pair: '__cflb=lb-pool; __oailb=jwt-pool',
+      route_pair_overridden: true,
+      route_pair_pool_gateway: 'unified-142',
+      route_pair_pool_version: 'tkt-7',
+    })
+    const badge = wrapper.get('[data-testid="route-pair-overridden-marker"]')
+    expect(badge.attributes('data-state')).toBe('applied')
+    expect(badge.text()).toContain('POOL')
+    expect(badge.text()).toContain('unified-142')
+    expect(wrapper.text()).not.toContain('__oailb')
+    // 票号只进 tooltip：它是和池子日志对账的键，不是读表时要扫的列。
+    const title = badge.get('span').attributes('title') || ''
+    expect(title).toContain('Pool ticket id: tkt-7')
+    expect(badge.text()).not.toContain('tkt-7')
+  })
+
+  // 注入 142 落 84：上游下发了新的 __oailb，徽标必须说「被改派」而不是「已覆写」。
+  it('marks the row as rerouted when the upstream landed it on another gateway', () => {
+    const wrapper = mountGwpoolRow({
+      route_gateway: 'unified-84',
+      route_pair: '__cflb=lb-fresh; __oailb=jwt-fresh',
+      route_pair_overridden: true,
+      route_pair_pool_gateway: 'unified-142',
+    })
+    const badge = wrapper.get('[data-testid="route-pair-overridden-marker"]')
+    expect(badge.attributes('data-state')).toBe('rerouted')
+    expect(badge.text()).toContain('REROUTED')
+    expect(badge.text()).toContain('unified-142 → unified-84')
+    expect(badge.html()).toContain('rose')
+  })
+
+  it('leaves the override badge off when the pair came from the account cookie jar', () => {
+    const wrapper = mountGwpoolRow({
+      route_gateway: 'unified-126',
+      route_pair: '__cflb=lb-jar; __oailb=jwt-jar',
+      route_pair_overridden: false,
+    })
+    expect(wrapper.find('[data-testid="route-pair-overridden-marker"]').exists()).toBe(false)
   })
 })
 

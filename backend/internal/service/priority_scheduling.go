@@ -345,7 +345,7 @@ func (s *defaultOpenAIAccountScheduler) applyPriorityScheduling(req OpenAIAccoun
 	plan.priorityScheduling = true
 	plan.topK = len(plan.candidates)
 	plan.includeOverflowFallback = true
-	plan.selectionOrder = s.buildOpenAISelectionOrder(req, *plan)
+	plan.selectionOrder = s.buildOpenAISelectionOrder(context.Background(), req, *plan) // 优先调度排序不读取 ctx（gwpool 置顶只在非优先分支生效）
 	s.recordPrioritySnapshot(req, c, plan.selectionOrder, now)
 	return true
 }

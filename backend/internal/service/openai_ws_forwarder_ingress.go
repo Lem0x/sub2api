@@ -107,6 +107,19 @@ func EnsureOpenAIWSIngressReader(c *gin.Context, conn *coderws.Conn) {
 	openAIWSGetIngressReader(c, conn)
 }
 
+// applyCodexWSPayloadIdentity 合并两边的 WS 帧身份改写：本模型命中 Codex 打票会话钉（ranxi
+// harvest pin）时按票会话钉身份；否则走 KlN 的账号身份 + 指纹收敛（applyCodexIdentityToWSPayload）。
+// 钉票分支先清掉上一帧暂存的收敛 ID，避免它们泄漏到本帧的出站头。
+func (s *OpenAIGatewayService) applyCodexWSPayloadIdentity(ctx context.Context, c *gin.Context, account *Account, model string, payload []byte) ([]byte, error) {
+	if s.harvestPinnedSessionForModel(ctx, account, model) != "" {
+		source := codexAccountIdentitySource(c, account)
+		stageCodexFingerprintIDs(c, nil)
+		stageCodexConvergenceBodyIdentity(c, source, nil)
+		return s.applyCodexAccountIdentityOrHarvestPinRaw(ctx, account, source, getAPIKeyIDFromContext(c), model, payload)
+	}
+	return applyCodexIdentityToWSPayload(c, account, payload)
+}
+
 func openAIWSIngressReaderFromContext(c *gin.Context) *openAIWSIngressReader {
 	if c == nil {
 		return nil
@@ -626,6 +639,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			ctx = withOpenAIFastPolicyContext(ctx, settings)
 		}
 	}
+	if account.UsesOpenAIRawRelay() {
+		return s.proxyResponsesWebSocketRawRelay(ctx, c, clientConn, account, token, firstClientMessage, hooks)
+	}
 
 	// The handler normally owns this registration across retry attempts. Direct
 	// callers still get the same session-scoped preemption behavior here.
@@ -648,8 +664,12 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	// a later bridge/ctx_pool account retry.
 	ingressReader := openAIWSGetIngressReader(c, clientConn)
 	ingressReader.setWaitFrameMode(false)
+	// 第三项是网关池接管（openai_gwpool.go）：WS 入站照常服务，这一轮桥到 HTTP/SSE 上游，
+	// 而不是打成 "websocket ingress requires ws_v2 transport"。这是 WS 入站这一侧的选路降级点，
+	// 所以必须先于下面按 ingressMode 分流。
 	forceHTTPBridge := account.Platform == PlatformGrok ||
-		(s.pluginManager != nil && s.pluginManager.ShouldRouteOpenAIOAuth(account))
+		(s.pluginManager != nil && s.pluginManager.ShouldRouteOpenAIOAuth(account)) ||
+		gatewayPoolDowngradesWSUpstream(wsDecision, account)
 	modeRouterV2Enabled := s != nil && s.cfg != nil && s.cfg.Gateway.OpenAIWS.ModeRouterV2Enabled
 	ingressMode := OpenAIWSIngressModeCtxPool
 	if modeRouterV2Enabled && !forceHTTPBridge {
@@ -840,6 +860,12 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			normalized = next
 		}
 		responsesLite := isOpenAIResponsesLiteWebSocketPayload(normalized)
+		// 时区投影必须抢在归一化之前：它会删掉 internal_chat_message_metadata_passthrough
+		// （上游 #7066，ChatGPT 拒收该字段），而本改写正是靠该字段的 create_time 定位消息
+		// 时刻、靠 content_item_kinds 判定哪段是 environment_context。删掉之后再改写只会
+		// 静默退化成 no-op。帧收口 applyCodexWSFrameWireProfile 里的同名调用保留：重复执行
+		// 幂等，且它还负责 user_location 那一半。
+		normalized = rewriteCodexEnvironmentTimezone(c, account, normalized)
 		if compatibilityBody, compatibilityChanged, compatibilityErr := normalizeOpenAIResponsesWebSocketCompatibilityBody(normalized, account, responsesLite); compatibilityErr != nil {
 			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", compatibilityErr)
 		} else if compatibilityChanged {
@@ -883,7 +909,13 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				nil,
 			)
 		}
-		if turnMetadata := strings.TrimSpace(c.GetHeader(openAIWSTurnMetadataHeader)); turnMetadata != "" {
+		frameTurnMetadata := gjson.GetBytes(normalized, "client_metadata."+openAIWSTurnMetadataHeader)
+		hasFrameTurnMetadata := frameTurnMetadata.Type == gjson.String && strings.TrimSpace(frameTurnMetadata.Str) != ""
+		// OAuth 账号（KlN Codex 出站身份对齐）：握手 metadata 只补缺失值，不能覆盖后续帧自己的
+		// 轮次和窗口。其他账号保持 ranxi 的握手身份归一：帧 metadata 统一为握手值（窗口切换检测
+		// 已在上面用原始帧窗口算过，不受影响）。
+		keepFrameTurnMetadata := hasFrameTurnMetadata && account.IsOpenAIOAuthLike()
+		if turnMetadata := strings.TrimSpace(c.GetHeader(openAIWSTurnMetadataHeader)); turnMetadata != "" && !keepFrameTurnMetadata {
 			next, setErr := applyPayloadMutation(normalized, "client_metadata."+openAIWSTurnMetadataHeader, turnMetadata)
 			if setErr != nil {
 				return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", setErr)
@@ -895,11 +927,11 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		if mapped := strings.TrimSpace(gjson.GetBytes(normalized, "model").String()); mapped != "" {
 			identityModel = mapped
 		}
-		accountScopedPayload, scopeErr := s.applyCodexAccountIdentityOrHarvestPinRaw(ctx, account, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c), identityModel, normalized)
-		if scopeErr != nil {
-			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket identity metadata", scopeErr)
+		identityPayload, identityErr := s.applyCodexWSPayloadIdentity(ctx, c, account, identityModel, normalized)
+		if identityErr != nil {
+			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket identity metadata", identityErr)
 		}
-		normalized = accountScopedPayload
+		normalized = identityPayload
 		if responsesLite {
 			litePayload, _, liteErr := normalizeOpenAIResponsesLitePayloadForAccount(normalized, account)
 			if liteErr != nil {
@@ -1076,6 +1108,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		writeCtx, cancel := newOpenAIWSDownstreamWriteContext(ctx, hooks, s.openAIWSWriteTimeout())
 		defer cancel()
 		message = restoreCodexToolNamesFromContext(c, message)
+		// 客户端在 WS 上持有的 turn-state 只来自这里转发的 response.metadata 事件，
+		// 铸造账号必须在这个边界记录，跨账号回带守卫才认得出（openai_codex_turn_state.go）。
+		s.noteOpenAICodexTurnStateFromWSEvent(c, account, message)
 		return WriteCapturedWSClient(writeCtx, clientConn, coderws.MessageText, message)
 	}
 
@@ -1083,13 +1118,21 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	ctx = context.WithValue(ctx, openAIWSDisconnectKey{}, (<-chan struct{})(clientReader.done))
 	readClientMessage := func() ([]byte, error) {
 		idleTimeout := s.openAIWSIngressInterTurnIdleTimeout()
-		readCtx := ctx
-		if idleTimeout > 0 {
-			var cancel context.CancelFunc
-			readCtx, cancel = context.WithTimeout(ctx, idleTimeout)
-			defer cancel()
+		var msgType coderws.MessageType
+		var payload []byte
+		var readErr error
+		if hooks != nil && hooks.ClientReadMessage != nil {
+			// 网关池等待客户端（KlN）已接管下游读：从它取帧，空闲超时由它负责。
+			msgType, payload, readErr = hooks.ClientReadMessage(ctx, idleTimeout)
+		} else {
+			readCtx := ctx
+			if idleTimeout > 0 {
+				var cancel context.CancelFunc
+				readCtx, cancel = context.WithTimeout(ctx, idleTimeout)
+				defer cancel()
+			}
+			msgType, payload, readErr = clientReader.read(readCtx)
 		}
-		msgType, payload, readErr := clientReader.read(readCtx)
 		if isOpenAIWSSessionPreempted(ctx) {
 			return nil, errOpenAIWSSessionPreempted
 		}
@@ -1122,7 +1165,16 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	}
 
 	useHTTPBridge := forceHTTPBridge || s.shouldBridgeOpenAIWSHTTP(account, firstPayload.payloadBytes, firstPayload.previousResponseID)
-	turnState := strings.TrimSpace(c.GetHeader(openAIWSTurnStateHeader))
+	// 客户端回带的 turn-state：已知由其他账号铸造（failover 换号）则剥离。
+	turnState := s.guardOpenAICodexTurnStateValue(c, account, c.GetHeader(openAIWSTurnStateHeader))
+	turnState = s.applyOpenAICodexTurnStateOverrideWSManualOnly(c, account, turnState)
+	// clientTurnState 只保存"客户端自己持有的值"，双开的帧内只承载它：真客户端的 turn_state
+	// 是每轮新建的 OnceLock（core/src/client.rs:292、:522-526），只可能来自本轮上游的
+	// response.metadata 事件；网关握手铸出的值、会话存储里的旧值客户端从未收到过，复用连接
+	// 开新一轮时真客户端首帧确实不带（core/tests/suite/turn_state.rs:140、:152 断言 null）。
+	// 例外：账号配了 turn-state 覆写时，上面 applyOpenAICodexTurnStateOverrideWSManualOnly 已把
+	// turnState 换成覆写值，这里刻意让它一并进帧——双开握手头被删，帧内是唯一通道。
+	clientTurnState := turnState
 	stateStore := s.getOpenAIWSStateStore()
 	groupID, enforceGroup := openAITurnAdmissionGroupFromContext(c)
 	apiKeyID := getAPIKeyIDFromContext(c)
@@ -1146,7 +1198,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}
 		if turnState == "" && stateStore != nil && sessionHash != "" {
 			if savedTurnState, ok := stateStore.GetSessionTurnState(groupID, sessionHash); ok {
-				turnState = savedTurnState
+				turnState = s.guardOpenAICodexTurnStateValue(c, account, savedTurnState)
+				turnState = s.applyOpenAICodexTurnStateOverrideWSManualOnly(c, account, turnState)
 			}
 		}
 
@@ -1290,8 +1343,22 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					return fmt.Errorf("resolve Grok websocket cache identity: %w", err)
 				}
 			}
+			// 网关池的 per-request 标记：AttachRoute 往 sink 写，下面 publish 到这一轮的结果上。
+			// **每一轮一个 sink**：WS 这条路上一轮就是一发真实上游请求，和 HTTP 入口那五处
+			// 「一次请求一个 sink」是同一回事。
+			//
+			// 漏了这一行的后果不是「少记一笔」：sink 为 nil 时 gatewayPoolRouteDegraded 的第一道
+			// 闸（applied.Cookie == ""）直接放行 ⇒ **state-echo 在这条路上永远不跑**，判到降智的
+			// 答案会原样流给客户端，而这正是这个功能唯一的承诺；gatewayPoolRenew 同样恒早退；
+			// 用量行则因 routePairInUse 判 fromPool=false 掉进「回读罐」的兜底，把**罐里那张旧
+			// pair 的网关**写进 route_gateway —— 这一发实际走的是池子的网关，页面显示的是另一个，
+			// 徽标还说「没覆写」。那张卡片唯一要回答的问题被答反了。
+			//
+			// 走到这里的是被网关池强制降级下来的 WS 上游（gatewayPoolTakesOverWSUpstream），
+			// 降级本身是对的 —— AttachRoute 照常注入池子那张 pair，缺的只是这一侧的读数。
+			turnCtx, gwpoolSink := withOpenAIGatewayPoolSink(ctx, c)
 			result, bridgeErr := s.proxyOpenAIWSHTTPBridgeTurn(
-				ctx,
+				turnCtx,
 				c,
 				account,
 				token,
@@ -1305,6 +1372,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				turn,
 				writeClientMessage,
 			)
+			// publish 必须排在 AfterTurn **之前**：用量就是在那个钩子里落的。
+			gwpoolSink.publish(result)
 			if bridgeErr != nil && isOpenAIWSSessionPreempted(ctx) {
 				return errOpenAIWSSessionPreempted
 			}
@@ -1401,6 +1470,13 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			if parseErr != nil {
 				return parseErr
 			}
+			// A new client turn gets a new wait budget. Same-turn failover
+			// reenters this function with the existing holder and keeps it.
+			if c != nil {
+				c.Set(gatewayPoolWaitGinKey, &gatewayPoolWaitHolder{})
+			}
+			ctx = context.WithValue(ctx, gatewayPoolWaitKey{}, (*gatewayPoolWaitState)(nil))
+			ctx = context.WithValue(ctx, gatewayPoolRetryOnlyKey{}, gatewayPoolRetryOnly{})
 			currentBridgePayload = nextPayload
 		}
 	}
@@ -1625,15 +1701,22 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		connID := strings.TrimSpace(lease.ConnID())
 		if handshakeTurnState := strings.TrimSpace(lease.HandshakeHeader(openAIWSTurnStateHeader)); handshakeTurnState != "" {
 			turnState = handshakeTurnState
+			// 该 blob 由本账号铸造：记下来，客户端将来（经 response.metadata 事件收到后）
+			// 回带到别的账号时守卫才认得出。
+			s.noteOpenAICodexTurnStateOrigin(c, account, handshakeTurnState)
 			if stateStore != nil && sessionHash != "" {
 				stateStore.BindSessionTurnState(groupID, sessionHash, handshakeTurnState, s.openAIWSSessionStickyTTL())
 			}
-			updatedHeaders := cloneHeader(baseAcquireReq.Headers)
-			if updatedHeaders == nil {
-				updatedHeaders = make(http.Header)
+			// 双开：握手不带 turn-state（client.rs:1241 传 None），后续拨号同样不能带；
+			// 帧内只承载客户端自己的值（clientTurnState），网关铸出的不进帧。
+			if !codexDeviceWireProfileEnabled(c, account) {
+				updatedHeaders := cloneHeader(baseAcquireReq.Headers)
+				if updatedHeaders == nil {
+					updatedHeaders = make(http.Header)
+				}
+				updatedHeaders.Set(openAIWSTurnStateHeader, handshakeTurnState)
+				baseAcquireReq.Headers = updatedHeaders
 			}
-			updatedHeaders.Set(openAIWSTurnStateHeader, handshakeTurnState)
-			baseAcquireReq.Headers = updatedHeaders
 		}
 		logOpenAIWSModeInfo(
 			"ingress_ws_upstream_connected account_id=%d turn=%d conn_id=%s conn_reused=%v conn_idle_ms=%d conn_age_ms=%d upstream_pings=%d conn_pick_ms=%d queue_wait_ms=%d preferred_conn_id=%s",
@@ -1678,10 +1761,16 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		defer finishDrain()
 		ctx := turnCtx
 		wroteDownstream := false
+		// 双开：turn-state 走帧内、顶层字段序对齐真客户端。放在发送边界。HTTP 桥接路径
+		// 不经过这里：桥是网关自造形态（WS 客户端 → HTTP 上游，默认关闭），它出站的
+		// turn-state 头仍是网关持有的值，不套帧内规则。
+		payload = s.guardOpenAICodexWSFrameTurnState(c, account, payload)
+		payload = applyCodexWSFrameWireProfile(c, account, payload, clientTurnState)
 		if err := s.acquireOpenAIRPMForSend(ctx, latest); err != nil {
 			return nil, err
 		}
-		if err := lease.WriteJSONWithContextTimeout(ctx, json.RawMessage(payload), s.openAIWSWriteTimeout()); err != nil {
+		s.scheduleCodexWSSideCalls(c, account, baseAcquireReq.Headers, payload)
+		if err := writeCodexWSFrame(ctx, c, account, lease, payload, s.openAIWSWriteTimeout()); err != nil {
 			return nil, wrapOpenAIWSIngressTurnError(
 				"write_upstream",
 				fmt.Errorf("write upstream websocket request: %w", err),

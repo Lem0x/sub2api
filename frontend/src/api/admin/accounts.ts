@@ -77,6 +77,71 @@ export async function list(
   return data
 }
 
+export interface GatewayPoolQueueGroup {
+  count: number
+  gateways: string[]
+}
+
+export interface GatewayPoolQueueView {
+  model: string
+  valid_until: string
+  quality: GatewayPoolQueueGroup
+  ordinary: GatewayPoolQueueGroup
+}
+
+export interface GatewayPoolProgress {
+  run_id?: string
+  sequence?: number
+  phase: 'idle' | 'pending' | 'fetching' | 'verifying' | 'waiting' | 'ready' | 'exhausted' | 'unknown' | 'cancelled'
+  attempt: number
+  limit: number
+  rejected: number
+  gateway?: string
+  started_at: string
+  updated_at: string
+  elapsed_ms: number
+  active_requests: number
+  runtime?: {
+    observed_at: string
+    tickets: Array<{ gateway: string; region: string; expires_at?: string; verified_at?: string; verified_models: string[] }>
+    rounds: GatewayPoolUsageRound[]
+    archived: Record<string, { rounds: number; attempted: number; full: number; duration_ms: number; active_duration_ms?: number; active_duration_incomplete?: boolean; incomplete?: boolean; duration_incomplete?: boolean }> | null
+    incomplete?: boolean
+    history?: Record<string, unknown>
+    contacts?: Record<string, unknown>
+    ledger_tag?: string
+    gateway_window_seconds?: number
+    current_concurrency?: number | null
+    concurrency_limit?: number
+    cooldown_estimate?: { resume_gateways: number; eligible_at?: string }
+    queues?: GatewayPoolQueueView | null
+    rest?: { active: boolean; changed_at?: string; started_at?: string; resume_at?: string; next_check?: string; reason?: string }
+  }
+}
+
+export interface GatewayPoolUsageRound {
+  id: string
+  model: string
+  started_at: string
+  ended_at?: string
+  end_reason?: string
+  attempted: number
+  full: number
+  full_started_at?: string
+  full_duration_ms?: number
+  full_usage_mode?: string
+  full_active_until?: string[]
+  duration_incomplete?: boolean
+  incomplete?: boolean
+}
+
+export async function getGatewayPoolProgress(ids: number[], signal?: AbortSignal): Promise<Record<number, GatewayPoolProgress>> {
+  const { data } = await apiClient.get<Record<number, GatewayPoolProgress>>('/admin/accounts/gateway-pool-progress', {
+    params: { ids: ids.join(',') }, signal
+  })
+  return data
+}
+
 export interface AccountListWithEtagResult {
   notModified: boolean
   etag: string | null
@@ -1429,7 +1494,13 @@ export async function refreshOpenCodeGoUsage(id: number): Promise<OpenCodeGoUsag
   return data
 }
 
+export async function retryGatewayPool(id: number): Promise<{ state: 'cleared' }> {
+  const { data } = await apiClient.post(`/admin/accounts/${id}/gateway-pool-retry`)
+  return data
+}
+
 export const accountsAPI = {
+  retryGatewayPool,
   list,
   listWithEtag,
   getUpstreamBillingRatesWithEtag,

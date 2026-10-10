@@ -59,6 +59,12 @@ func sameAccountRetryDelayFor(failoverErr *service.UpstreamFailoverError, retryC
 	if failoverErr == nil {
 		return sameAccountRetryDelay
 	}
+	if !failoverErr.SameAccountRetryNotBefore.IsZero() {
+		if remaining := time.Until(failoverErr.SameAccountRetryNotBefore); remaining > 0 {
+			return remaining
+		}
+		return 0
+	}
 	if failoverErr.SameAccountRetryDelay > 0 {
 		return failoverErr.SameAccountRetryDelay
 	}
@@ -82,6 +88,9 @@ func sameAccountRetryAllowed(failoverErr *service.UpstreamFailoverError, retryCo
 	}
 	if !sameAccountRetryDeadlineAllows(failoverErr) {
 		return false
+	}
+	if failoverErr.GatewayPoolRetry {
+		return true // the pool's logical request deadline, not a quota-saving count
 	}
 	// Error-specific caps (Grok capacity/stream-idle) remain hard limits even
 	// when the error also carries a freshly reconstructed deadline.

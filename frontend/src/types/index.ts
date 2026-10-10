@@ -641,6 +641,7 @@ export interface AdminGroup extends Group {
   free_openai_fast: boolean
   // 仅允许流式请求（管理端请求策略，用户侧分组不返回）
   stream_only: boolean
+  openai_gwpool_active_accounts?: number
   model_pricing: import('@/api/admin/channels').ChannelModelPricing[]
   // 分组利润控制（openai/anthropic/gemini/grok/antigravity 分组可启用；margin/buffer 为小数存储）。
   // 仅管理员可见：与 rate_multiplier 相乘即可反推上游成本上限，不得下放到 Group。
@@ -831,6 +832,7 @@ export interface CreateGroupRequest {
   force_openai_fast?: boolean
   free_openai_fast?: boolean
   stream_only?: boolean
+  openai_gwpool_active_accounts?: number
   model_pricing?: import('@/api/admin/channels').ChannelModelPricing[]
   allow_image_generation?: boolean
   allow_batch_image_generation?: boolean
@@ -898,6 +900,7 @@ export interface UpdateGroupRequest {
   force_openai_fast?: boolean
   free_openai_fast?: boolean
   stream_only?: boolean
+  openai_gwpool_active_accounts?: number
   model_pricing?: import('@/api/admin/channels').ChannelModelPricing[]
   allow_image_generation?: boolean
   allow_batch_image_generation?: boolean
@@ -958,7 +961,7 @@ export type KnownAccountPlatform = 'anthropic' | 'openai' | 'gemini' | 'antigrav
  * `string & {}` 保留内置平台的字面量补全。
  */
 export type AccountPlatform = KnownAccountPlatform | (string & {})
-export type AccountType = 'oauth' | 'setup-token' | 'apikey' | 'upstream' | 'bedrock' | 'service_account'
+export type AccountType = 'oauth' | 'setup-token' | 'apikey' | 'upstream' | 'bedrock' | 'service_account' | 'cpr'
 export type OAuthAddMethod = 'oauth' | 'setup-token'
 export type ProxyProtocol = 'http' | 'https' | 'socks5' | 'socks5h'
 
@@ -1086,6 +1089,7 @@ export interface TempUnschedulableState {
 
 export interface TempUnschedulableStatus {
   active: boolean
+  gateway_pool_rest?: boolean
   state?: TempUnschedulableState
 }
 
@@ -1340,7 +1344,7 @@ export interface Account {
   opencode_go_usage?: OpenCodeGoUsageState
   // Extra fields including Codex usage, OpenAI compact capability, and model-level rate limits.
   extra?: (CodexUsageSnapshot & OpenAICompactState & {
-    model_rate_limits?: Record<string, { rate_limited_at: string; rate_limit_reset_at: string }>
+    model_rate_limits?: Record<string, { rate_limited_at: string; rate_limit_reset_at: string; reason?: string }>
     antigravity_credits_overages?: Record<string, { activated_at: string; active_until: string }>
     upstream_billing_provider?: 'new_api'
     upstream_billing_probe_enabled?: boolean
@@ -1881,7 +1885,17 @@ export interface CodexSessionImportResult {
 // ==================== Usage & Redeem Types ====================
 
 export type RedeemCodeType = 'balance' | 'concurrency' | 'subscription' | 'invitation'
-export type UsageRequestType = 'unknown' | 'sync' | 'stream' | 'ws_v2' | 'cyber' | 'live'
+export type UsageRequestType =
+  | 'unknown'
+  | 'sync'
+  | 'stream'
+  | 'ws_v2'
+  | 'cyber'
+  | 'live'
+  | 'probe'
+  // gwpool_degraded: state-echo 判定路由降智后整发丢掉的那次上游尝试。它真的到了上游，
+  // 但判定点在响应体一个字节都没读的时刻 ⇒ token 与金额恒为 0，是审计行不是账单行。
+  | 'gwpool_degraded'
 export type ImageSizeSource = 'output' | 'input' | 'default' | 'legacy'
 export type ImageSizeBreakdown = Record<string, number>
 
@@ -1966,6 +1980,26 @@ export interface AdminUsageLog extends UsageLog {
   upstream_model_mismatch?: boolean | null
   model_mapping_chain?: string | null
   upstream_request_id?: string | null
+  // Codex 回合状态：上游本次铸出的 x-codex-turn-state（不透明 Fernet 密文）
+  turn_state?: string | null
+  // 本次出站是否实际注入了 turn-state 覆写值
+  turn_state_overridden?: boolean | null
+  // 覆写来源：manual（手填）/ auto（自动接管）/ auto_stale（候选已过保鲜期但仍在用）
+  turn_state_source?: string | null
+  // 本次出站实际带的 turn-state（客户端回带的或注入的），与 turn_state（上游新铸的）分开
+  turn_state_sent?: string | null
+  // 上游响应头 x-codex-safety-buffering-enabled / -faster-model 的读数（上游没带为 null）
+  safety_buffering_enabled?: boolean | null
+  safety_buffering_faster_model?: string | null
+  // 这一发生效的路由对读数：网关段从 __oailb 的 JWT 载荷解出，整串留着以便原样复现
+  route_gateway?: string | null
+  route_pair?: string | null
+  // 这一发出站的路由对由网关池下发（顶掉了账号罐回放）；null = 账号类型不适用
+  route_pair_overridden?: boolean | null
+  // 池子交付这组 pair 时说的网关；与 route_gateway 比对就知道注入被上游接受没有
+  route_pair_pool_gateway?: string | null
+  // 池子给这张票的身份（cookie_version），用来和池子侧日志对账；不是 cookie 本体
+  route_pair_pool_version?: string | null
 
   // 账号计费倍率（仅管理员可见）
   account_rate_multiplier?: number | null

@@ -29,7 +29,7 @@ func TestPriorityComparableCapacityFavorsLowerLatency(t *testing.T) {
 	counts := map[int64]int{}
 	for i := 0; i < 2000; i++ {
 		req.SessionHash = fmt.Sprint(i)
-		order := scheduler.buildOpenAISelectionOrder(req, plan)
+		order := scheduler.buildOpenAISelectionOrder(context.Background(), req, plan)
 		counts[order[0].account.ID]++
 	}
 	require.Greater(t, counts[1], 1200, "lower P90 must matter even when both accounts miss the target: %v", counts)

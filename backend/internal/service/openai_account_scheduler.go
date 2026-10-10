@@ -488,7 +488,8 @@ func (s *defaultOpenAIAccountScheduler) Select(
 		}
 	}
 
-	if !req.StickyWeighted {
+	if (!req.StickyWeighted || gatewayPoolPreferences(ctx)[req.StickyAccountID].verified) &&
+		!gatewayPoolPreferAlternative(ctx, req.StickyAccountID) {
 		selection, escapedSticky, err := s.selectBySessionHash(ctx, req)
 		if err != nil {
 			return nil, decision, err
@@ -990,7 +991,7 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAIAccountLoadPlan(
 		candidateCount:            len(candidates),
 	}
 	if len(candidates) == 0 {
-		plan.selectionOrder = s.buildOpenAISelectionOrder(req, plan)
+		plan.selectionOrder = s.buildOpenAISelectionOrder(ctx, req, plan)
 		return plan
 	}
 
@@ -1144,14 +1145,18 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAIAccountLoadPlan(
 		plan.topK = 1
 	}
 
-	plan.selectionOrder = s.buildOpenAISelectionOrder(req, plan)
+	plan.selectionOrder = s.buildOpenAISelectionOrder(ctx, req, plan)
 	return plan
 }
 
 func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
+	ctx context.Context,
 	req OpenAIAccountScheduleRequest,
 	plan openAIAccountLoadPlan,
 ) []openAIAccountCandidateScore {
+	if req.StickyWeighted {
+		ctx = withGatewayPoolStickyPreference(ctx, req.StickyPreviousAccountID, req.StickyAccountID)
+	}
 	buildSelectionOrder := func(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
 		if len(pool) == 0 || plan.topK <= 0 {
 			return nil
@@ -1164,6 +1169,7 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 			groupTopK = len(pool)
 		}
 		ranked := selectTopKOpenAICandidates(pool, groupTopK)
+		ranked = gatewayPoolTopCandidates(ctx, pool, ranked)
 		var primary []openAIAccountCandidateScore
 		if req.StickyWeighted {
 			skipSessionSticky := false
@@ -1203,6 +1209,7 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 		if len(primary) == 0 {
 			primary = buildOpenAIWeightedSelectionOrder(ranked, req)
 		}
+		gatewayPoolOrder(ctx, primary, func(candidate openAIAccountCandidateScore) *Account { return candidate.account })
 		if !plan.includeOverflowFallback || groupTopK >= len(pool) {
 			return primary
 		}
@@ -1660,6 +1667,11 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 			MaxConcurrency: account.EffectiveLoadFactor(),
 		})
 	}
+	filtered = gatewayPoolDedupeCandidates(ctx, filtered, req.StickyPreviousAccountID, req.StickyAccountID)
+	loadReq = loadReq[:0]
+	for _, account := range filtered {
+		loadReq = append(loadReq, AccountWithConcurrency{ID: account.ID, MaxConcurrency: account.EffectiveLoadFactor()})
+	}
 	if len(filtered) == 0 {
 		if rpmEligible > 0 && filterStats.reasons["oauth_rpm_exhausted"] == rpmEligible {
 			return nil, 0, 0, 0, fmt.Errorf("%w: %s", ErrOpenAIRPMExhausted, filterStats.summary("all eligible OAuth accounts are at their per-minute limit"))
@@ -2012,6 +2024,16 @@ func (s *defaultOpenAIAccountScheduler) isAccountRequestCompatibleReason(ctx con
 	}
 	if s != nil && s.service != nil && s.service.isOpenAIAccountRequestRuntimeBlocked(account, req.RequestedModel, req.RequireCompact) {
 		return false, "runtime_blocked"
+	}
+	// 模型级限流（spark 429、降智暂停）也要在主过滤就排掉：否则停着的账号挤占 TopK 名额，
+	// 到 fresh/DB 复核才被拒，候选多于 TopK 时健康账号轮不到——与下面 quota auto-pause 同一个坑。
+	if req.RequestedModel != "" {
+		if limited, held := account.modelRateLimitStateForRequest(ctx, req.RequestedModel, time.Now()); limited {
+			if held {
+				return false, openAITurnStateHoldLimitReason
+			}
+			return false, "model_rate_limited"
+		}
 	}
 	if s != nil && s.service != nil && s.service.isOpenAIProxyStreamQuarantined(ctx, account) {
 		return false, "proxy_stream_quarantined"
@@ -2405,23 +2427,90 @@ func (s *OpenAIGatewayService) selectAccountWithScheduler(
 	previousResponseCanMove bool,
 	useUpstreamTokenCost bool,
 ) (selection *AccountSelectionResult, decision OpenAIAccountScheduleDecision, err error) {
-	selection, decision, err = s.selectAccountWithSchedulerOnce(ctx, groupID, previousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, platform, previousResponseCanMove, useUpstreamTokenCost)
-	if err == nil || openAIProxyStreamQuarantineBypassed(ctx) {
-		return selection, decision, err
+	// ranxi 的代理流熔断 fail-open（#5056）并入下面的循环：每轮先正常选，ErrNoAvailable*
+	// 且有被隔离代理时带 bypass 重选一次。网关池（gwpool）相关的轮转/续办/组级复核只对
+	// opt-in 的网关池账号生效，普通账号在第一轮即按原逻辑返回。
+	if _, ok := ctx.Value(gatewayPoolGroupLimitsKey{}).(*gatewayPoolGroupLimits); !ok {
+		ctx = context.WithValue(ctx, gatewayPoolGroupLimitsKey{}, &gatewayPoolGroupLimits{})
 	}
-	if !errors.Is(err, ErrNoAvailableAccounts) && !errors.Is(err, ErrNoAvailableCompactAccounts) {
-		return selection, decision, err
+	if sessionHash != "" && s.cache != nil {
+		if bound, bindErr := s.getStickySessionAccountID(ctx, groupID, sessionHash); bindErr == nil && bound > 0 {
+			ctx = context.WithValue(ctx, gatewayPoolExistingBindingKey{}, bound)
+		}
 	}
-	// The circuit only ever quarantines PlatformOpenAI accounts.
-	if NormalizeOpenAICompatiblePlatform(platform) != PlatformOpenAI {
-		return selection, decision, err
+	var rotationAllowed map[int64]struct{}
+	excludedIDs, rotationAllowed, err = gatewayPoolRotationExclusions(ctx, s.accountRepo, groupID, excludedIDs)
+	if err != nil {
+		return nil, decision, err
 	}
-	blocked := s.getOpenAIProxyStreamCircuit().activeBlockCount(time.Now())
-	if blocked == 0 {
-		return selection, decision, err
+	strongBinding := (strings.TrimSpace(previousResponseID) != "" && !previousResponseCanMove) ||
+		s.resolveOpenAIGuardianParentAccountID(ctx, groupID) > 0
+	selectionChecks := gatewayPoolSelectionRechecks
+	expandedPoolChecks := false
+	for check := 0; check < selectionChecks; check++ {
+		selection, decision, err = s.selectAccountWithSchedulerOnce(ctx, groupID, previousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, platform, previousResponseCanMove, useUpstreamTokenCost)
+		if err != nil && !openAIProxyStreamQuarantineBypassed(ctx) &&
+			(errors.Is(err, ErrNoAvailableAccounts) || errors.Is(err, ErrNoAvailableCompactAccounts)) &&
+			NormalizeOpenAICompatiblePlatform(platform) == PlatformOpenAI {
+			if blocked := s.getOpenAIProxyStreamCircuit().activeBlockCount(time.Now()); blocked > 0 {
+				s.logOpenAIProxyStreamQuarantineFailOpen(requestedModel, blocked)
+				ctx = withOpenAIProxyStreamQuarantineBypass(ctx)
+				selection, decision, err = s.selectAccountWithSchedulerOnce(ctx, groupID, previousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, platform, previousResponseCanMove, useUpstreamTokenCost)
+			}
+		}
+		if err != nil {
+			return selection, decision, err
+		}
+		if !gatewayPoolRotationRecheck(ctx, s.accountRepo, rotationAllowed, selection) {
+			if selection != nil && selection.ReleaseFunc != nil {
+				selection.ReleaseFunc()
+			}
+			return nil, decision, ErrNoAvailableAccounts
+		}
+		if requiredImageCapability != "" || strongBinding {
+			allowed, restErr := s.gatewayPoolResumeAllowed(ctx, selection.Account, true)
+			boundID, _ := ctx.Value(gatewayPoolExistingBindingKey{}).(int64)
+			if restErr == nil && allowed && !strongBinding && selection.Account.ID != boundID && groupID != nil && selection.Account.UsesGatewayPool() {
+				identity, identityErr := s.codexCookies.gatewayPoolIdentity(ctx, selection.Account)
+				allowed = identityErr == nil && s.codexCookies.poolRounds.claim(*groupID, identity, s.gatewayPoolActiveAccountLimit(ctx, groupID))
+			}
+			if restErr == nil && allowed {
+				return selection, decision, nil
+			}
+			if selection.ReleaseFunc != nil {
+				selection.ReleaseFunc()
+			}
+			return nil, decision, ErrNoAvailableAccounts // never move a strong binding to bypass rest
+		}
+		if s.gatewayPoolRoundSelectionAllowed(ctx, groupID, selection) {
+			return selection, decision, nil
+		}
+		// A concurrent request exhausted the chosen credential after our snapshot.
+		// Release its slot and refresh selection, without sending or increasing the
+		// handler's bounded failover budget. Never retry the rejected row here.
+		if selection.ReleaseFunc != nil {
+			selection.ReleaseFunc()
+		}
+		// Capacity rejections are deliberate pre-send rotation, not a race.
+		// Give every opted-in row at most one chance in addition to the small
+		// race budget; request exclusions below still prohibit revisiting.
+		if !expandedPoolChecks && groupID != nil && s.accountRepo != nil {
+			expandedPoolChecks = true
+			if cohort, listErr := s.accountRepo.ListByPlatform(ctx, PlatformOpenAI); listErr == nil {
+				for i := range cohort {
+					if gatewayPoolRotationAccount(&cohort[i], *groupID) {
+						selectionChecks++
+					}
+				}
+			}
+		}
+		excludedIDs = cloneExcludedAccountIDs(excludedIDs)
+		if excludedIDs == nil {
+			excludedIDs = map[int64]struct{}{}
+		}
+		excludedIDs[selection.Account.ID] = struct{}{}
 	}
-	s.logOpenAIProxyStreamQuarantineFailOpen(requestedModel, blocked)
-	return s.selectAccountWithSchedulerOnce(withOpenAIProxyStreamQuarantineBypass(ctx), groupID, previousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, platform, previousResponseCanMove, useUpstreamTokenCost)
+	return nil, decision, ErrNoAvailableAccounts
 }
 
 type openAIGroupPrivacyRequirementContextKey struct{}
@@ -2551,6 +2640,18 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 	// 仍须装门。其余媒体路径通过 WithOpenAIProfitControlSuppressed 显式跳过。
 	if requiredImageCapability == "" {
 		ctx = s.withOpenAIProfitControlGate(ctx, groupID)
+	}
+	strongBinding := (strings.TrimSpace(previousResponseID) != "" && !previousResponseCanMove) ||
+		s.resolveOpenAIGuardianParentAccountID(ctx, groupID) > 0
+	if !strongBinding {
+		ctx = s.withGatewayPoolAccountPreferences(ctx, OpenAIAccountScheduleRequest{
+			GroupID: groupID, Platform: platform, RequestedModel: requestedModel,
+			SessionHash: sessionHash,
+			ExcludedIDs: excludedIDs, RequiredTransport: requiredTransport,
+			RequiredCapability: requiredCapability, RequiredImageCapability: requiredImageCapability, RequireCompact: requireCompact,
+			RequirePrivacySet: s.openAIGroupRequiresPrivacySet(ctx, groupID),
+		})
+		excludedIDs = gatewayPoolRoundExclusions(ctx, excludedIDs)
 	}
 	platform = NormalizeOpenAICompatiblePlatform(platform)
 	decision := OpenAIAccountScheduleDecision{}
@@ -2772,6 +2873,10 @@ func (s *OpenAIGatewayService) isOpenAIAccountTransportCompatible(account *Accou
 		return false
 	}
 	if requiredTransport == OpenAIUpstreamTransportResponsesWebsocketV2Ingress {
+		if account.IsCPR() {
+			// CPR 原生接受 WS，走原样中继的一对一隧道；只认全局与账号的强制 HTTP 开关。
+			return s.cfg != nil && s.cfg.Gateway.OpenAIWS.Enabled && !s.cfg.Gateway.OpenAIWS.ForceHTTP && !account.IsOpenAIWSForceHTTPEnabled()
+		}
 		if s.cfg == nil || !s.cfg.Gateway.OpenAIWS.ModeRouterV2Enabled {
 			return s.getOpenAIWSProtocolResolver().Resolve(account).Transport == OpenAIUpstreamTransportResponsesWebsocketV2
 		}
@@ -3185,7 +3290,7 @@ func openAIUpstreamCostFactors(accounts []*Account, now time.Time, oauthScheduli
 			continue
 		}
 		factors[account.ID] = openAIUpstreamCostNeutralFactor
-		if !account.IsOpenAIApiKey() && !account.IsOpenAIOAuthLike() {
+		if !account.IsOpenAIApiKey() && !account.TargetsChatGPTCodexUpstream() {
 			continue
 		}
 		eligibleCount++
@@ -3249,7 +3354,7 @@ func newOpenAILegacyUpstreamRateOrder(accounts []*Account, now time.Time, oauthS
 		// 与 openAIUpstreamCostFactors 使用同一道平台门控：只有 OpenAI 平台账号
 		// 的倍率参与 legacy 低倍率优先排序。上游自报倍率来自中转方，不能让它对
 		// 其他平台的调度产生影响——否则自报低价即可吸走流量，而实际结算走本地倍率。
-		if !account.IsOpenAIApiKey() && !account.IsOpenAIOAuthLike() {
+		if !account.IsOpenAIApiKey() && !account.TargetsChatGPTCodexUpstream() {
 			continue
 		}
 		rate, ok := openAISchedulingRate(account, now, oauthSchedulingRateMultiplier)
@@ -3267,10 +3372,12 @@ func newOpenAILegacyUpstreamRateOrder(accounts []*Account, now time.Time, oauthS
 }
 
 func openAISchedulingRate(account *Account, now time.Time, oauthSchedulingRateMultiplier *float64) (float64, bool) {
-	if account == nil || (!account.IsOpenAIApiKey() && !account.IsOpenAIOAuthLike()) {
+	if account == nil || (!account.IsOpenAIApiKey() && !account.TargetsChatGPTCodexUpstream()) {
 		return 0, false
 	}
-	if account.IsOpenAIOAuthLike() {
+	// cpr 的上游是同一份 ChatGPT 订阅，成本因子与 oauth 同一个参考倍率；
+	// 它没有 upstream billing probe，走 else 分支会恒为中性因子被排除在排序外。
+	if account.TargetsChatGPTCodexUpstream() {
 		if rate := oauthSchedulingRateMultiplier; rate != nil && *rate >= 0 && !math.IsNaN(*rate) && !math.IsInf(*rate, 0) {
 			return *rate, true
 		}

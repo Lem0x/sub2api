@@ -310,10 +310,7 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 	if req != nil && req.URL != nil {
 		targetHost = req.URL.Host
 	}
-	proxyInfo := "direct"
-	if proxyURL != "" {
-		proxyInfo = safeUpstreamPoolID(proxyURL)
-	}
+	proxyInfo := proxyKeyForLog(proxyURL)
 	slog.Debug("tls_fingerprint_enabled", "account_id", accountID, "target", targetHost, "proxy", proxyInfo, "profile", profile.Name)
 
 	if err := s.validateRequestHost(req); err != nil {
@@ -623,6 +620,9 @@ func (s *httpUpstreamService) getClientEntryWithTLS(proxyURL string, accountID i
 	settings = s.applyProfilePoolSettings(settings, upstreamProfile)
 	// TLS 指纹客户端使用独立的缓存键，加 "tls:" 前缀
 	cacheKey := "tls:" + buildCacheKey(isolation, proxyKey, accountID, upstreamProtocolModeDefault)
+	if upstreamProfile == service.HTTPUpstreamProfileOpenAIConfirmation {
+		cacheKey += ":confirmation"
+	}
 	poolKey := buildPoolKey(settings, upstreamProtocolModeDefault) + ":tls"
 
 	now := time.Now()
@@ -673,7 +673,8 @@ func (s *httpUpstreamService) getClientEntryWithTLS(proxyURL string, accountID i
 	}
 
 	// 创建带 TLS 指纹的 Transport
-	slog.Debug("tls_fingerprint_creating_new_client", "account_id", accountID, "cache_key", safeUpstreamPoolID(cacheKey), "proxy", safeUpstreamPoolID(proxyKey))
+	// cache_key 里拼着完整代理 URL（含账密），只记录哈希；proxy 脱敏为 scheme://host。
+	slog.Debug("tls_fingerprint_creating_new_client", "account_id", accountID, "cache_key", safeUpstreamPoolID(cacheKey), "proxy", proxyKeyForLog(proxyKey))
 	transport, err := buildUpstreamTransportWithTLSFingerprint(settings, parsedProxy, profile)
 	if err != nil {
 		s.mu.Unlock()
@@ -786,6 +787,9 @@ func (s *httpUpstreamService) getClientEntry(proxyURL string, accountID int64, a
 	settings = s.applyProfilePoolSettings(settings, profile)
 	// 构建缓存键（根据隔离策略不同）
 	cacheKey := buildCacheKey(isolation, proxyKey, accountID, protocolMode)
+	if profile == service.HTTPUpstreamProfileOpenAIConfirmation {
+		cacheKey += ":confirmation"
+	}
 	// 构建连接池配置键（用于检测配置变更）
 	poolKey := buildPoolKey(settings, protocolMode)
 
@@ -1029,7 +1033,7 @@ func (s *httpUpstreamService) resolvePoolSettings(isolation string, accountConcu
 
 func (s *httpUpstreamService) applyProfilePoolSettings(settings poolSettings, profile service.HTTPUpstreamProfile) poolSettings {
 	switch profile {
-	case service.HTTPUpstreamProfileOpenAI:
+	case service.HTTPUpstreamProfileOpenAI, service.HTTPUpstreamProfileOpenAIConfirmation:
 		settings.responseHeaderTimeout = 0
 		if s != nil && s.cfg != nil && s.cfg.Gateway.OpenAIResponseHeaderTimeout > 0 {
 			settings.responseHeaderTimeout = time.Duration(s.cfg.Gateway.OpenAIResponseHeaderTimeout) * time.Second
@@ -1136,7 +1140,7 @@ func (s *httpUpstreamService) resolveProtocolMode(profile service.HTTPUpstreamPr
 	if profile == service.HTTPUpstreamProfileOpenAIHarvest {
 		return upstreamProtocolModeOpenAIH1NoReuse
 	}
-	if profile != service.HTTPUpstreamProfileOpenAI {
+	if profile != service.HTTPUpstreamProfileOpenAI && profile != service.HTTPUpstreamProfileOpenAIConfirmation {
 		return upstreamProtocolModeDefault
 	}
 	settings := s.resolveOpenAIHTTP2Settings()
@@ -1241,7 +1245,7 @@ func isUpstreamTimeoutError(err error) bool {
 }
 
 func (s *httpUpstreamService) recordOpenAIHTTP2Failure(profile service.HTTPUpstreamProfile, protocolMode, proxyKey string, err error) {
-	if profile != service.HTTPUpstreamProfileOpenAI || protocolMode != upstreamProtocolModeOpenAIH2 {
+	if (profile != service.HTTPUpstreamProfileOpenAI && profile != service.HTTPUpstreamProfileOpenAIConfirmation) || protocolMode != upstreamProtocolModeOpenAIH2 {
 		return
 	}
 	settings := s.resolveOpenAIHTTP2Settings()
@@ -1255,13 +1259,13 @@ func (s *httpUpstreamService) recordOpenAIHTTP2Failure(profile service.HTTPUpstr
 	activated, until := state.recordFailure(time.Now(), settings.fallbackErrorThreshold, settings.fallbackWindow, settings.fallbackTTL)
 	if activated {
 		slog.Warn("openai_http2_proxy_fallback_activated",
-			"proxy", safeUpstreamPoolID(proxyKey),
+			"proxy", proxyKeyForLog(proxyKey),
 			"fallback_until", until.Format(time.RFC3339))
 	}
 }
 
 func (s *httpUpstreamService) recordOpenAIHTTP2Success(profile service.HTTPUpstreamProfile, protocolMode, proxyKey string) {
-	if profile != service.HTTPUpstreamProfileOpenAI || protocolMode != upstreamProtocolModeOpenAIH2 {
+	if (profile != service.HTTPUpstreamProfileOpenAI && profile != service.HTTPUpstreamProfileOpenAIConfirmation) || protocolMode != upstreamProtocolModeOpenAIH2 {
 		return
 	}
 	if !isHTTPProxyKey(proxyKey) {
@@ -1332,6 +1336,18 @@ func (s *openAIHTTP2FallbackState) recordFailure(now time.Time, threshold int, w
 	s.windowStart = time.Time{}
 	s.errorCount = 0
 	return true, s.fallbackUntil
+}
+
+// proxyKeyForLog 把代理 key / URL 脱成 scheme://host：key 里带着用户名密码，任何日志级别都不能落。
+func proxyKeyForLog(proxyKey string) string {
+	if proxyKey == "" || proxyKey == directProxyKey {
+		return "direct"
+	}
+	u, err := url.Parse(proxyKey)
+	if err != nil || u.Host == "" {
+		return "invalid"
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 // normalizeProxyURL 标准化代理 URL
@@ -1618,9 +1634,30 @@ func decompressResponseBody(resp *http.Response) {
 	var reader io.Reader
 	switch ce {
 	case "gzip":
-		gr, err := gzip.NewReader(resp.Body)
+		// 不能把 resp.Body 直接交给 gzip.NewReader：它要先读掉 10 字节以上的头才知道成不成，
+		// 失败时那些字节已经从 body 里消失，而下面的 return 又保留着 Content-Encoding: gzip，
+		// 下游收到的是"声称 gzip 的残缺流"——比原样透传上游发来的东西更糟。
+		// 先套 bufio 探魔数；不匹配时零消费透传，匹配后初始化失败则保留读取错误。
+		bufferedBody := bufio.NewReader(resp.Body)
+		resp.Body = &decompressedBody{reader: bufferedBody, closer: originalBody}
+		// 只 Peek 魔数与压缩方法这 3 个字节。不能 Peek 更多：Peek(n) 会阻塞到攒够 n 字节，
+		// 而 gzip 的 SSE 流首个 flush 可能不足 n 就停下等下一个事件，多 Peek 一点就把流式
+		// 拖成卡住。3 字节严格少于旧代码 readHeader 的 10 字节，不会比原来更容易阻塞。
+		magic, _ := bufferedBody.Peek(3)
+		if len(magic) < 3 || magic[0] != 0x1f || magic[1] != 0x8b || magic[2] != 8 {
+			// 带 Content-Encoding 的空体（204/304、空错误体）会走到这里，网关规模下不该刷屏。
+			if len(magic) > 0 {
+				slog.Warn("gzip_decompress_failed", "error", "body is not a gzip stream")
+			}
+			return
+		}
+		gr, err := gzip.NewReader(bufferedBody)
 		if err != nil {
-			return // 解压失败，保持原样
+			// 初始化已消费部分头，不能再把残余体冒充原文。错误留在 Body.Read，
+			// 不升级为 Do 的连接错误；关闭仍交给原始 Body，以释放连接和在途计数。
+			resp.Body = &decompressedBody{readErr: fmt.Errorf("initialize gzip response: %w", err), closer: originalBody}
+			slog.Warn("gzip_decompress_failed", "error", err)
+			return
 		}
 		reader = gr
 	case "br":
@@ -1671,11 +1708,15 @@ func (r *zstdResponseReader) Read(p []byte) (int, error) {
 
 // decompressedBody 组合解压 reader 和原始 body 的 close。
 type decompressedBody struct {
-	reader io.Reader
-	closer io.Closer
+	reader  io.Reader
+	closer  io.Closer
+	readErr error
 }
 
 func (d *decompressedBody) Read(p []byte) (int, error) {
+	if d.readErr != nil {
+		return 0, d.readErr
+	}
 	return d.reader.Read(p)
 }
 

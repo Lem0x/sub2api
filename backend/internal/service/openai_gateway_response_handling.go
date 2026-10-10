@@ -75,8 +75,12 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	// OpenAI 首个语义输出前只暂存，溯源在 applyAttemptResponseHeaders 真正提交时记录。
 	if stageFirstOutput {
 		stageOpenAICodexTurnState(&attemptResponseHeaders, resp.Header)
+		stageOpenAICodexSafetyBufferingHeaders(&attemptResponseHeaders, resp.Header)
 	} else {
 		s.relayOpenAICodexTurnState(c, account, resp.Header)
+		if c != nil && c.Writer != nil {
+			relayOpenAICodexSafetyBufferingHeaders(c.Writer.Header(), resp.Header)
+		}
 	}
 
 	// Set SSE response headers
@@ -217,7 +221,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	var firstOutputTimer *time.Timer
 	var firstOutputCh <-chan time.Time
 	if firstOutputTimeout > 0 {
-		remaining := time.Until(startTime.Add(firstOutputTimeout))
+		remaining := time.Until(gatewayPoolFirstOutputStart(ctx, startTime).Add(firstOutputTimeout))
 		if remaining <= 0 {
 			remaining = time.Nanosecond
 		}
@@ -259,7 +263,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	failedMessage := ""
 	var grokScopedFailure error
 	clientOutputStarted := false
-	codexFailureTerminal := account != nil && account.IsOpenAIOAuthLike()
+	codexFailureTerminal := openAICodexFailureTerminal(account)
 	upstreamRequestID := strings.TrimSpace(resp.Header.Get("x-request-id"))
 	var streamEarlyErr error
 	terminalFailurePending := false
@@ -1657,6 +1661,8 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 	// This heuristic is NOT applied to API-key accounts to avoid false
 	// positives on JSON responses that coincidentally contain "data:" or
 	// "event:" in their text content.
+	// cpr 不在此列：CPR 对响应恒显式写 Content-Type（流式 text/event-stream、
+	// 非流式 application/json，且 content-type 不从上游透传），这条分支对它不可达。
 	if account.Type == AccountTypeOAuth && bodyLooksLikeSSE {
 		return s.handleSSEToJSON(resp, c, account, body, originalModel, mappedModel)
 	}
@@ -1698,6 +1704,7 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 	// Codex 协议要求 /responses/compact JSON 响应携带 x-codex-turn-state
 	// （codex-api/src/endpoint/compact.rs 从响应头捕获），显式回传。
 	s.relayOpenAICodexTurnState(c, account, resp.Header)
+	relayOpenAICodexSafetyBufferingHeaders(c.Writer.Header(), resp.Header)
 
 	contentType := "application/json"
 	if s.cfg != nil && !s.cfg.Security.ResponseHeaders.Enabled {
@@ -1809,6 +1816,7 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 	responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
 	logOpenAISuccessMissingUsage(c.Request.Context(), c, account, resp, usage, terminalType, false)
 	s.relayOpenAICodexTurnState(c, account, resp.Header)
+	relayOpenAICodexSafetyBufferingHeaders(c.Writer.Header(), resp.Header)
 
 	contentType := "application/json; charset=utf-8"
 	if !ok {
@@ -2423,4 +2431,11 @@ func (s *OpenAIGatewayService) replaceModelInSSEBody(body, fromModel, toModel st
 		lines[i] = s.replaceModelInSSELine(line, fromModel, toModel)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// openAICodexFailureTerminal 判定流里的 error / response.failed 是否按 ChatGPT
+// Codex 后端的终态语义处理。按「上游是谁」分流：cpr 中继的是同一个后端，CPR 对
+// SSE 事件只做归一化转发（transport/canonical.rs），事件语义不变。
+func openAICodexFailureTerminal(account *Account) bool {
+	return account != nil && account.TargetsChatGPTCodexUpstream()
 }

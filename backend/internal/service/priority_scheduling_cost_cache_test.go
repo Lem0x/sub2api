@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -49,7 +50,7 @@ func TestPrioritySchedulingCostRefreshReusesHistoryAndChangesSelection(t *testin
 	require.InDelta(t, -0.6, *refreshed[1].Profit, 1e-9)
 	require.Contains(t, refreshed[1].Reasons, "historical_loss")
 	require.Less(t, refreshed[1].SelectionWeight, refreshed[2].SelectionWeight)
-	order := scheduler.buildOpenAISelectionOrder(req, plan)
+	order := scheduler.buildOpenAISelectionOrder(context.Background(), req, plan)
 	require.Equal(t, int64(2), order[0].account.ID)
 
 	pool[0].account.Extra[AccountCostMultiplierExtraKey] = 0.0

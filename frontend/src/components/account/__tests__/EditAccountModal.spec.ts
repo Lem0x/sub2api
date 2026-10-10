@@ -14,10 +14,10 @@ import {
 } from '@/constants/platformCatalog'
 
 const { updateAccountMock, checkMixedChannelRiskMock, authIsSimpleMode, showErrorMock } = vi.hoisted(() => ({
-  showErrorMock: vi.fn(),
   updateAccountMock: vi.fn(),
   checkMixedChannelRiskMock: vi.fn(),
-  authIsSimpleMode: { value: true }
+  authIsSimpleMode: { value: true },
+  showErrorMock: vi.fn()
 }))
 
 vi.mock('@/stores/app', () => ({
@@ -41,7 +41,16 @@ vi.mock('@/api/admin', () => ({
     accounts: {
       getManagementCapabilities: vi.fn().mockResolvedValue({ web_search_enabled: false, account_quota_notify_enabled: false }),
       update: updateAccountMock,
-      checkMixedChannelRisk: checkMixedChannelRiskMock
+      checkMixedChannelRisk: checkMixedChannelRiskMock,
+      // turn-state 覆写表的模型下拉走这个接口（AccountTestModal 同款）。
+      getAvailableModels: vi.fn().mockResolvedValue([{ id: 'gpt-5.6-luna' }, { id: 'gpt-6-astra' }])
+    },
+    proxies: {
+      // 292 猎手的代理多选走这个接口，懒加载。
+      getAll: vi.fn().mockResolvedValue([
+        { id: 20, name: 'webshare', protocol: 'socks5', host: 'p.webshare.io', port: 1080 },
+        { id: 21, name: 'b2proxy', protocol: 'http', host: 'gw.b2proxy.example', port: 8000 }
+      ])
     },
     settings: {
       getWebSearchEmulationConfig: vi.fn().mockResolvedValue({ enabled: false, providers: [] }),
@@ -1602,6 +1611,33 @@ describe('EditAccountModal', () => {
     )
   })
 
+  it('toggles the API-key-only raw relay switch in extra', async () => {
+    const account = buildAccount()
+    account.type = 'apikey'
+    updateAccountMock.mockReset()
+    checkMixedChannelRiskMock.mockReset()
+    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
+    updateAccountMock.mockResolvedValue(account)
+
+    const wrapper = mountModal(account)
+    await wrapper.get('[data-testid="edit-openai-raw-relay-toggle"]').trigger('click')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.openai_raw_relay).toBe(true)
+
+    account.extra = { openai_raw_relay: true }
+    updateAccountMock.mockReset()
+    updateAccountMock.mockResolvedValue(account)
+    const enabled = mountModal(account)
+    // 关闭后删键，不写 false
+    await enabled.get('[data-testid="edit-openai-raw-relay-toggle"]').trigger('click')
+    await enabled.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_raw_relay')
+
+    const oauth = buildAccount()
+    oauth.type = 'oauth'
+    expect(mountModal(oauth).find('[data-testid="edit-openai-raw-relay-toggle"]').exists()).toBe(false)
+  })
+
   it('writes the upstream request id header into extra only when it changes', async () => {
     const account = buildAccount()
     account.extra = { openai_compact_mode: 'force_on' }
@@ -1643,6 +1679,516 @@ describe('EditAccountModal', () => {
     expect(updateAccountMock).toHaveBeenCalledTimes(1)
     expect(updateAccountMock.mock.calls[0]?.[1]?.extra).toBeDefined()
     expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('upstream_request_id_header')
+  })
+
+  // 网关池：配置全在账号级（池子的 consumer key 是按账号发的）。
+  it('fixes credential isolation and removes pool-recommendation controls and saved switches', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = {
+      openai_gwpool: true, openai_gwpool_base_url: 'http://127.0.0.1:8099', openai_gwpool_consumer_key: 'offline',
+      openai_gwpool_member_isolation: false, openai_gwpool_use_recommended_cooldown: true
+    }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    for (const name of ['member-isolation', 'use-recommendation']) {
+      expect(wrapper.find(`[data-testid="edit-openai-gwpool-${name}"]`).exists()).toBe(false)
+    }
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(wrapper.get('[data-testid="edit-openai-gwpool-credential-scope"]').text()).toContain('gwpoolCredentialScope')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_member_isolation')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_use_recommended_cooldown')
+    wrapper.unmount()
+  })
+
+  it('writes the account-level gateway pool config into extra', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+
+    const wrapper = mountModal(account)
+    // 关着时地址与凭据的输入框不渲染。
+    expect(wrapper.find('[data-testid="edit-openai-gwpool-base-url"]').exists()).toBe(false)
+    await wrapper.get('[data-testid="edit-openai-gwpool-enabled"]').setValue(true)
+    await wrapper.get('[data-testid="edit-openai-gwpool-base-url"]').setValue('http://127.0.0.1:8099')
+    await wrapper.get('[data-testid="edit-openai-gwpool-consumer-key"]').setValue('ck-fresh')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    const extra = updateAccountMock.mock.calls[0]?.[1]?.extra
+    expect(extra?.openai_gwpool).toBe(true)
+    expect(extra?.openai_gwpool_base_url).toBe('http://127.0.0.1:8099')
+    expect(extra?.openai_gwpool_consumer_key).toBe('ck-fresh')
+  })
+
+  // consumer key 按密码类处理：已存的值后端脱敏成 true，页面不回显，留空 = 不修改。
+  // 这里 delete 就会在每次保存账号时把凭据抹掉。
+  it('never echoes a saved gateway pool consumer key and keeps it when left blank', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = {
+      openai_gwpool: true,
+      openai_gwpool_base_url: 'http://127.0.0.1:8099',
+      openai_gwpool_consumer_key: true // 后端脱敏后的形态
+    }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+
+    const wrapper = mountModal(account)
+    const keyInput = wrapper.get<HTMLInputElement>('[data-testid="edit-openai-gwpool-consumer-key"]')
+    expect(keyInput.element.type).toBe('password')
+    expect(keyInput.element.value).toBe('')
+    expect(keyInput.attributes('placeholder')).toBe('admin.accounts.openai.gwpoolConsumerKeyKeep')
+
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    const extra = updateAccountMock.mock.calls[0]?.[1]?.extra
+    expect(extra).toHaveProperty('openai_gwpool_consumer_key')
+    expect(extra?.openai_gwpool_consumer_key).toBe(true)
+  })
+
+  it('removes the gateway pool switch from extra when toggled off', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = { openai_gwpool: true, openai_gwpool_base_url: 'http://127.0.0.1:8099' }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+
+    const wrapper = mountModal(account)
+    const toggle = wrapper.get<HTMLInputElement>('[data-testid="edit-openai-gwpool-enabled"]')
+    expect(toggle.element.checked).toBe(true)
+    await toggle.setValue(false)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    const extra = updateAccountMock.mock.calls[0]?.[1]?.extra
+    expect(extra).not.toHaveProperty('openai_gwpool')
+  })
+
+  it('hides the gateway pool section for OpenAI API key accounts', async () => {
+    const wrapper = mountModal(buildAccount()) // apikey
+    expect(wrapper.find('[data-testid="edit-openai-gwpool-section"]').exists()).toBe(false)
+  })
+
+  // 「一轮最多试几张票」现在是常驻旋钮：降智防护 2026-10-03 删成零档，预热无条件跑，
+  // 所以那个下拉和「跟着档位显示」都没了。
+  it('replaces the ticket-count limit with shared recovery including explicit zero', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = { openai_gwpool: true, openai_gwpool_base_url: 'https://pool.0102400.xyz' }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+
+    const wrapper = mountModal(account)
+    const knob = '[data-testid="edit-openai-gwpool-prepare-retries"]'
+    expect(wrapper.find('[data-testid="edit-openai-gwpool-warm-tickets"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="edit-openai-gwpool-guard"]').exists(), '档位下拉已删').toBe(false)
+    expect(wrapper.find(knob).exists()).toBe(true)
+
+    await wrapper.get(knob).setValue('0')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.openai_gwpool_prepare_retries).toBe(0)
+
+    // 清空 = 回到后端默认值（5）= 不落键，别在 extra 里堆默认项。
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    await wrapper.get(knob).setValue('')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_prepare_retries')
+  })
+
+  // 四个旋钮：留空 = 用后端默认值，所以默认形态下一个键都不该落（避免 extra 堆默认项）。
+  it('removes the protection switch and restores protection when saving legacy off settings', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = { openai_gwpool: true, openai_gwpool_base_url: 'https://pool.0102400.xyz',
+      openai_gwpool_prewarm: true, openai_gwpool_guard_enabled: false }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    expect(wrapper.find('[data-testid="edit-openai-gwpool-guard-enabled"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="edit-openai-gwpool-prewarm"]').exists()).toBe(false)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_guard_enabled')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_prewarm')
+  })
+
+  it('writes the gateway pool knobs only when they differ from the defaults', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+
+    const wrapper = mountModal(account)
+    await wrapper.get('[data-testid="edit-openai-gwpool-enabled"]').setValue(true)
+    await wrapper.get('[data-testid="edit-openai-gwpool-base-url"]').setValue('https://pool.0102400.xyz')
+    await wrapper.get('[data-testid="edit-openai-gwpool-consumer-key"]').setValue('ck-fresh')
+    // 「填到 sub2api 里的 base_url」提示：用户踩过 /a/xxxx 个人页面那个坑。
+    expect(wrapper.get('[data-testid="edit-openai-gwpool-base-url-hint"]').text()).toBe(
+      'admin.accounts.openai.gwpoolBaseUrlDesc'
+    )
+    expect(wrapper.find('[data-testid="edit-openai-gwpool-steering"]').exists()).toBe(false)
+    // 三个「秒」旋钮都要有上限：后端的 time.Duration 在 1e10 秒量级会乘溢出成负数，
+    // 本地账本会整体静默失效（与「窗口越大越严」正好相反），取票超时同量级则全量取不到票。
+    for (const testid of [
+      'edit-openai-gwpool-gateway-window',
+      'edit-openai-gwpool-fetch-timeout',
+      'edit-openai-gwpool-list-timeout'
+    ]) {
+      const input = wrapper.get<HTMLInputElement>(`[data-testid="${testid}"]`)
+      expect(input.attributes('min')).toBe(testid === 'edit-openai-gwpool-gateway-window' ? '3600' : '1')
+      expect(input.attributes('max')).toBe('86400')
+    }
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    // 降智防护 2026-10-03 删成零档：下拉和合并前那两个勾选框都不许再出现，只剩一段常驻说明。
+    for (const testid of [
+      'edit-openai-gwpool-guard',
+      'edit-openai-gwpool-state-echo',
+      'edit-openai-gwpool-degraded-retry'
+    ]) {
+      expect(wrapper.find(`[data-testid="${testid}"]`).exists(), testid).toBe(false)
+    }
+    expect(wrapper.find('[data-testid="edit-openai-gwpool-guard-hint"]').exists()).toBe(false)
+    const details = wrapper.get<HTMLDetailsElement>('[data-testid="edit-openai-gwpool-details"]')
+    expect(details.element.open).toBe(false)
+    expect(details.get('summary').text()).toBe('admin.accounts.openai.gwpoolDetails')
+    for (const key of ['gwpoolGatewayWindowDesc', 'gwpoolFetchTimeoutDesc', 'gwpoolListTimeoutDesc', 'gwpoolPrepareRetriesDesc']) {
+      expect(wrapper.get('[data-testid="edit-openai-gwpool-section"]').text()).toContain(`admin.accounts.openai.${key}`)
+    }
+    expect(details.text()).toContain('admin.accounts.openai.gwpoolGuardDetails')
+
+    let extra = updateAccountMock.mock.calls[0]?.[1]?.extra
+    expect(extra?.openai_gwpool_base_url).toBe('https://pool.0102400.xyz')
+    for (const key of [
+      'openai_gwpool_steering',
+      'openai_gwpool_prewarm',
+      'openai_gwpool_guard',
+      'openai_gwpool_state_echo',
+      'openai_gwpool_degraded_retries',
+      'openai_gwpool_gateway_window_s',
+      'openai_gwpool_fetch_timeout_s',
+      'openai_gwpool_list_timeout_s'
+    ]) {
+      expect(extra).not.toHaveProperty(key)
+    }
+
+    // 改过的才落键。
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    await wrapper.get('[data-testid="edit-openai-gwpool-gateway-window"]').setValue('7200')
+    await wrapper.get('[data-testid="edit-openai-gwpool-fetch-timeout"]').setValue('20')
+    await wrapper.get('[data-testid="edit-openai-gwpool-list-timeout"]').setValue('5')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    extra = updateAccountMock.mock.calls[0]?.[1]?.extra
+    expect(extra).not.toHaveProperty('openai_gwpool_steering')
+    expect(extra).not.toHaveProperty('openai_gwpool_prewarm')
+    expect(extra?.openai_gwpool_gateway_window_s).toBe(7200)
+    expect(extra?.openai_gwpool_fetch_timeout_s).toBe(20)
+    expect(extra?.openai_gwpool_list_timeout_s).toBe(5)
+  })
+
+  it('defaults cooldown resets to 24 hours and persists an explicit zero to disable', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = { openai_gwpool: true, openai_gwpool_base_url: 'https://pool.example.test' }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    const input = wrapper.get<HTMLInputElement>('[data-testid="edit-openai-gwpool-cooldown-reset"]')
+    expect(input.element.value).toBe('24')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.openai_gwpool_cooldown_reset_hours).toBe(24)
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    await input.setValue('24')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.openai_gwpool_cooldown_reset_hours).toBe(24)
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    await input.setValue('0')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.openai_gwpool_cooldown_reset_hours).toBe(0)
+    const reopened = mountModal({ ...account, extra: { ...account.extra, openai_gwpool_cooldown_reset_hours: 0 } })
+    expect(reopened.get<HTMLInputElement>('[data-testid="edit-openai-gwpool-cooldown-reset"]').element.value).toBe('0')
+    reopened.unmount()
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    await input.setValue('')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_cooldown_reset_hours')
+  })
+
+  it('opts into continuous waiting while retaining recovery settings and removing retired limits', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = {
+      openai_gwpool: true, openai_gwpool_base_url: 'https://pool.example.test',
+      openai_gwpool_max_wait_s: 90, openai_gwpool_rotation_min_gateways: 5,
+      openai_gwpool_resume_gateways: 30
+    }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    const checkbox = wrapper.get<HTMLInputElement>('[data-testid="edit-openai-gwpool-continuous-wait"]')
+    expect(checkbox.element.checked).toBe(false)
+    await checkbox.setValue(true)
+    expect(wrapper.find('[data-testid="edit-openai-gwpool-max-wait"]').exists()).toBe(false)
+    expect(wrapper.get<HTMLFieldSetElement>('[data-testid="edit-openai-gwpool-thresholds"]').element.disabled).toBe(true)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).toMatchObject({
+      openai_gwpool: true, openai_gwpool_base_url: 'https://pool.example.test',
+      openai_gwpool_resume_gateways: 30, openai_gwpool_continuous_wait: true
+    })
+    updateAccountMock.mockClear()
+    await checkbox.setValue(false)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    const extra = updateAccountMock.mock.calls[0]?.[1]?.extra
+    expect(extra).not.toHaveProperty('openai_gwpool_continuous_wait')
+    expect(extra.openai_gwpool_resume_gateways).toBe(30)
+    expect(extra).not.toHaveProperty('openai_gwpool_max_wait_s')
+    expect(extra).not.toHaveProperty('openai_gwpool_rotation_min_gateways')
+    expect(wrapper.get<HTMLFieldSetElement>('[data-testid="edit-openai-gwpool-thresholds"]').element.disabled).toBe(false)
+  })
+
+  it('removes early probing and clears its obsolete saved settings', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = {
+      openai_gwpool: true, openai_gwpool_base_url: 'https://pool.example.test',
+      openai_gwpool_early_probe_enabled: true, openai_gwpool_early_probe_state: { at: 'old' }
+    }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    expect(wrapper.find('[data-testid="edit-openai-gwpool-early-probe"]').exists()).toBe(false)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_early_probe_enabled')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_early_probe_state')
+  })
+
+  it('removes the rotation switch and its retired shortage threshold', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = { openai_gwpool: true, openai_gwpool_base_url: 'https://pool.example.test' }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    expect(wrapper.find('[data-testid="edit-openai-gwpool-rotation"]').exists()).toBe(false)
+    const threshold = '[data-testid="edit-openai-gwpool-rotation-min-gateways"]'
+    expect(wrapper.find(threshold).exists()).toBe(false)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_rotation')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_rotation_min_gateways')
+    const saved = mountModal({ ...account, extra: {
+      ...account.extra, openai_gwpool_rotation: false, openai_gwpool_rotation_min_gateways: 4
+    } })
+    expect(saved.find('[data-testid="edit-openai-gwpool-rotation"]').exists()).toBe(false)
+    expect(saved.find(threshold).exists()).toBe(false)
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    await saved.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_rotation_min_gateways')
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    await saved.get('[data-testid="edit-openai-gwpool-enabled"]').setValue(false)
+    await saved.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_rotation')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_rotation_min_gateways')
+  })
+
+  it('keeps default50 recovery independent from retired stop settings and saves overrides', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = { openai_gwpool: true, openai_gwpool_base_url: 'https://pool.example.test',
+      openai_gwpool_rotation_min_gateways: 10 }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    const recovery = wrapper.get<HTMLInputElement>('[data-testid="edit-openai-gwpool-resume-gateways"]')
+    expect(recovery.element.value).toBe('')
+    expect(recovery.attributes('placeholder')).toBe('50')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_rotation_min_gateways')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_resume_gateways')
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    await recovery.setValue('60')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.openai_gwpool_resume_gateways).toBe(60)
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_rotation_min_gateways')
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    await recovery.setValue('')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_resume_gateways')
+    wrapper.unmount()
+  })
+
+  it('removes aggregate wait settings without altering per-operation timeouts', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = { openai_gwpool: true, openai_gwpool_base_url: 'https://pool.example.test',
+      openai_gwpool_auto_wait: false, openai_gwpool_max_wait_s: 600, openai_gwpool_fetch_timeout_s: 12 }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    expect(wrapper.find('[data-testid="edit-openai-gwpool-auto-wait"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="edit-openai-gwpool-max-wait"]').exists()).toBe(false)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    const savedExtra = updateAccountMock.mock.calls[0]?.[1]?.extra
+    expect(savedExtra).not.toHaveProperty('openai_gwpool_auto_wait')
+    expect(savedExtra).not.toHaveProperty('openai_gwpool_max_wait_s')
+    expect(savedExtra?.openai_gwpool_fetch_timeout_s).toBe(12)
+    const loaded = mountModal({ ...account, extra: savedExtra })
+    expect(loaded.find('[data-testid="edit-openai-gwpool-max-wait"]').exists()).toBe(false)
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    await loaded.get('form#edit-account-form').trigger('submit.prevent')
+    const disabled = updateAccountMock.mock.calls[0]?.[1]?.extra
+    expect(disabled).not.toHaveProperty('openai_gwpool_auto_wait')
+    expect(disabled).not.toHaveProperty('openai_gwpool_max_wait_s')
+  })
+
+  it('removes probe-model selection and restores Luna when saving legacy business selection', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = { openai_gwpool: true, openai_gwpool_base_url: 'https://pool.example.test',
+      openai_gwpool_probe_model: 'business' }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    expect(wrapper.find('[data-testid="edit-openai-gwpool-probe-model"]').exists()).toBe(false)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_probe_model')
+  })
+
+  it('saves ticket timeout independently and restores defaults on clear or account switch', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = { openai_gwpool: true, openai_gwpool_base_url: 'https://pool.example.test',
+      openai_gwpool_prepare_retries: 1 }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    const timeout = wrapper.get<HTMLInputElement>('[data-testid="edit-openai-gwpool-probe-timeout"]')
+    expect(timeout.attributes('placeholder')).toBe('10')
+    expect(timeout.attributes('min')).toBe('1')
+    expect(timeout.attributes('max')).toBe('120')
+    expect(wrapper.get('[data-testid="edit-openai-gwpool-prepare-retries"]').attributes('placeholder')).toBe('0')
+    await timeout.setValue(10)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    const extra = updateAccountMock.mock.calls[0]?.[1]?.extra
+    expect(extra?.openai_gwpool_probe_timeout_s).toBe(10)
+    expect(extra?.openai_gwpool_prepare_retries).toBe(1)
+    expect(extra).not.toHaveProperty('openai_gwpool_max_wait_s')
+    await wrapper.setProps({ account: { ...account, id: 99, extra } })
+    expect(timeout.element.value).toBe('10')
+    await timeout.setValue('')
+    updateAccountMock.mockClear()
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_probe_timeout_s')
+    await wrapper.setProps({ account: { ...account, id: 100, extra: account.extra } })
+    expect(timeout.element.value).toBe('')
+    await timeout.setValue(10)
+    await wrapper.get('[data-testid="edit-openai-gwpool-enabled"]').setValue(false)
+    updateAccountMock.mockClear()
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_probe_timeout_s')
+    wrapper.unmount()
+  })
+
+  // 已存的旋钮要回显；清空输入框 = 回到默认值 = 把键删掉。
+  it('loads stored gateway pool knobs and drops them when cleared', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = {
+      openai_gwpool: true,
+      openai_gwpool_base_url: 'https://pool.0102400.xyz',
+      // 这两个键 2026-10-02 删掉了，老账号 extra 里还留着 ⇒ 保存时要顺手清掉。
+      openai_gwpool_all_models: true,
+      openai_gwpool_renew: true,
+      openai_gwpool_steering: false,
+      openai_gwpool_state_echo: false,
+      openai_gwpool_degraded_retries: 0,
+      openai_gwpool_gateway_window_s: 3600,
+      openai_gwpool_fetch_timeout_s: 15,
+      openai_gwpool_list_timeout_s: 3
+    }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+
+    const wrapper = mountModal(account)
+    // 覆写范围恒为推理面、续期已删 ⇒ 这两个勾选框不许再出现。
+    for (const testid of ['edit-openai-gwpool-all-models', 'edit-openai-gwpool-renew']) {
+      expect(wrapper.find(`[data-testid="${testid}"]`).exists(), testid).toBe(false)
+    }
+    expect(wrapper.find('[data-testid="edit-openai-gwpool-steering"]').exists()).toBe(false)
+    expect(
+      (wrapper.get('[data-testid="edit-openai-gwpool-gateway-window"]').element as HTMLInputElement).value
+    ).toBe('3600')
+    expect(
+      (wrapper.get('[data-testid="edit-openai-gwpool-fetch-timeout"]').element as HTMLInputElement).value
+    ).toBe('15')
+    expect(
+      (wrapper.get('[data-testid="edit-openai-gwpool-list-timeout"]').element as HTMLInputElement).value
+    ).toBe('3')
+
+    await wrapper.get('[data-testid="edit-openai-gwpool-gateway-window"]').setValue('')
+    await wrapper.get('[data-testid="edit-openai-gwpool-fetch-timeout"]').setValue('')
+    await wrapper.get('[data-testid="edit-openai-gwpool-list-timeout"]').setValue('')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    const extra = updateAccountMock.mock.calls[0]?.[1]?.extra
+    expect(extra).not.toHaveProperty('openai_gwpool_gateway_window_s')
+    expect(extra).not.toHaveProperty('openai_gwpool_fetch_timeout_s')
+    expect(extra).not.toHaveProperty('openai_gwpool_list_timeout_s')
+    // 已删的两个键不许被原样写回库里。
+    expect(extra).not.toHaveProperty('openai_gwpool_all_models')
+    expect(extra).not.toHaveProperty('openai_gwpool_renew')
+    // 降智防护的三个档位键 2026-10-03 全删了 ⇒ 保存时一并清掉，一个都不许写回库里。
+    // 这一条承重：这个号的 extra 里**存着** state_echo:false（它当初刻意把检测关了），
+    // 原样写回去等于把一个死键永久留在库里，而回滚到老后端时它会重新生效。
+    for (const key of [
+      'openai_gwpool_guard',
+      'openai_gwpool_state_echo',
+      'openai_gwpool_degraded_retries',
+      'openai_gwpool_steering'
+    ]) {
+      expect(extra, key).not.toHaveProperty(key)
+    }
+  })
+
+  // 配置错误的报错走 reason code → i18n 命名空间（文案本体由 gwpoolLocales.spec.ts 钉）。
+  // 这个 spec 的 t 桩把任何 key 原样回传，所以这里只能钉「没有映射时仍回落后端原串」，
+  // 也就是接 i18n 之前的行为不许丢。
+  it('keeps the backend message when no localized gateway pool mapping resolves', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    updateAccountMock.mockReset().mockRejectedValue({
+      reason: 'GWPOOL_CONSUMER_KEY_REQUIRED',
+      message: 'account 1 enables openai_gwpool so openai_gwpool_consumer_key must be set'
+    })
+
+    const wrapper = mountModal(account)
+    await wrapper.get('[data-testid="edit-openai-gwpool-enabled"]').setValue(true)
+    await wrapper.get('[data-testid="edit-openai-gwpool-base-url"]').setValue('https://pool.0102400.xyz')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(showErrorMock).toHaveBeenCalledWith(
+      'account 1 enables openai_gwpool so openai_gwpool_consumer_key must be set'
+    )
+  })
+
+  // turn-state 的接管/覆写界面已删（2026-09-21 起手段全灭），只剩读数。
+  it('no longer renders the turn-state override or hunter controls', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    const wrapper = mountModal(account)
+    for (const testid of [
+      'edit-openai-turn-state-deprecated',
+      'edit-openai-turn-state-auto',
+      'edit-openai-turn-state-override',
+      'edit-openai-turn-state-hunter',
+      'edit-openai-turn-state-hunter-section',
+      'edit-openai-turn-state-hunter-hold'
+    ]) {
+      expect(wrapper.find(`[data-testid="${testid}"]`).exists()).toBe(false)
+    }
+    // 恢复探测（做题判定，仍然有效）留着。
+    expect(wrapper.find('[data-testid="edit-openai-turn-state-recovery"]').exists()).toBe(true)
   })
 
   it('writes images_url_to_b64_json into extra when toggled on', async () => {
@@ -1748,6 +2294,49 @@ describe('EditAccountModal', () => {
 
     expect(updateAccountMock).toHaveBeenCalledTimes(1)
     expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.openai_long_context_billing_enabled).toBe(false)
+  })
+
+  it.each([undefined, false, 'true', 1])('keeps upstream recording off for non-true opt-in %s', async (value) => {
+    const account = buildAccount()
+    account.extra = { openai_upstream_recording_enabled: value }
+    updateAccountMock.mockReset()
+    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
+    updateAccountMock.mockResolvedValue(account)
+    const wrapper = mountModal(account)
+    expect(wrapper.get<HTMLInputElement>('[data-testid="openai-upstream-recording-enabled"]').element.checked).toBe(false)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.openai_upstream_recording_enabled).toBe(false)
+  })
+
+  it('submits independent upstream recording without enabling the gateway pool', async () => {
+    const account = buildAccount()
+    account.extra = {}
+    updateAccountMock.mockReset()
+    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
+    updateAccountMock.mockResolvedValue(account)
+    const wrapper = mountModal(account)
+    await wrapper.get('[data-testid="openai-upstream-recording-enabled"]').setValue(true)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.openai_upstream_recording_enabled).toBe(true)
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.openai_gwpool).not.toBe(true)
+  })
+
+  it('loads enabled upstream recording and allows explicit disable', async () => {
+    const account = buildOpenAIOAuthParentAccount()
+    account.extra = { openai_upstream_recording_enabled: true }
+    updateAccountMock.mockReset()
+    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
+    updateAccountMock.mockResolvedValue(account)
+    const wrapper = mountModal(account)
+    expect(wrapper.get<HTMLInputElement>('[data-testid="openai-upstream-recording-enabled"]').element.checked).toBe(true)
+    await wrapper.get('[data-testid="openai-upstream-recording-enabled"]').setValue(false)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.openai_upstream_recording_enabled).toBe(false)
+  })
+
+  it('does not offer OpenAI upstream recording for other providers', () => {
+    const wrapper = mountModal(buildGrokOAuthAccount())
+    expect(wrapper.find('[data-testid="openai-upstream-recording-enabled"]').exists()).toBe(false)
   })
 
   it('fails closed for malformed OpenAI long-context billing values', async () => {
@@ -2085,6 +2674,48 @@ describe('EditAccountModal', () => {
 	  expect(updateAccountMock).toHaveBeenCalledTimes(1)
 	  expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.auto_pause_5h_threshold).toBe(0.95)
 	  expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.auto_pause_7d_threshold).toBe(0.96)
+	})
+
+	it('submits OpenAI extra settings for cpr accounts', async () => {
+	  // 回归：cpr 走不进那个写 updatePayload.extra 的分支时，自动暂停阈值的控件
+	  // 照常显示、能改、保存提示成功，但 extra 从头到尾没被赋值——重开弹窗全空，
+	  // 额度打满后账号继续被调度直到上游 429。回填与写入必须共用同一个判定。
+	  const account = buildAccount()
+	  account.type = 'cpr'
+	  account.credentials = {
+	    base_url: 'http://127.0.0.1:18081',
+	    api_key: 'sk_cpr',
+	    admin_base_url: 'http://127.0.0.1:18081',
+	    admin_api_key: 'admin_cpr',
+	    cpr_account_id: 'acct_0199c0ffee'
+	  }
+	  account.extra = { auto_pause_5h_threshold: 0.9 }
+	  updateAccountMock.mockReset()
+	  checkMixedChannelRiskMock.mockReset()
+	  checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
+	  updateAccountMock.mockResolvedValue(account)
+
+	  const wrapper = mountModal(account)
+
+	  // 回填：cpr 也要读得出已有的阈值，否则会出现「保存后一刷新变默认值」。
+	  expect(
+	    wrapper.get<HTMLInputElement>('[data-testid="auto-pause-5h-threshold"]').element.value
+	  ).toBe('90')
+
+	  await wrapper.get('[data-testid="auto-pause-5h-threshold"]').setValue('95')
+	  await wrapper.get('[data-testid="auto-pause-7d-threshold"]').setValue('80')
+	  await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+	  expect(updateAccountMock).toHaveBeenCalledTimes(1)
+	  const extra = updateAccountMock.mock.calls[0]?.[1]?.extra
+	  expect(extra?.auto_pause_5h_threshold).toBe(0.95)
+	  expect(extra?.auto_pause_7d_threshold).toBe(0.8)
+	  // 同一个门控放开的另外两项也必须落库。
+	  expect(extra).toHaveProperty('openai_long_context_billing_enabled')
+	  // 自动透传与 WS 模式对 cpr 后端硬返回 false，不得因此被写进来。
+	  expect(extra).not.toHaveProperty('openai_passthrough')
+	  expect(extra).not.toHaveProperty('openai_oauth_responses_websockets_v2_mode')
+	  expect(extra).not.toHaveProperty('openai_apikey_responses_websockets_v2_mode')
 	})
 
 	it('submits OpenAI quota auto-pause disable flag in extra', async () => {

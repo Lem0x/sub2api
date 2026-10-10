@@ -32,7 +32,11 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 	body []byte,
 	promptCacheKey string,
 	defaultMappedModel string,
-) (*OpenAIForwardResult, error) {
+) (forwarded *OpenAIForwardResult, err error) {
+	// 网关池的 per-request 标记（openai_gwpool.go）：AttachRoute 往 sink 写，这里 publish 到结果上。
+	// 新增一条能打到 chatgpt.com 的转发入口时要照抄这两行。
+	ctx, gwpoolSink := withOpenAIGatewayPoolSink(ctx, c)
+	defer func() { gwpoolSink.publish(forwarded) }()
 	latest, admissionErr := s.admitOpenAITurn(
 		context.WithoutCancel(ctx),
 		c,
@@ -263,9 +267,39 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 		if codexResult.PromptCacheKey != "" {
 			promptCacheKey = codexResult.PromptCacheKey
 		}
+		// 打票钉住的流量必须沿用发票探针的身份：不合成桥身份、不做账号命名空间与指纹收敛。
+		harvestPins := s.harvestPinsCodexIdentity(ctx, account, upstreamModel)
+		// 双开：把桥伪装成一个真客户端会话——先在入站侧合成客户端原始身份（会话/线程 v7、每轮 turn v7、
+		// 窗口、turn-metadata、默认 prompt_cache_key，见 openai_compat_bridge_identity.go），再交给下面与
+		// /responses 完全相同的账号隔离 → 指纹收敛 → 线协议投影管线派生出站；桥自己不再单独写任何会话头。
+		// 非双开桥零改动（不注入）。入站头在本函数返回时还原，避免漏给 failover 的下一账号。
+		bridgeRestore, bridgeIdentity := func() {}, false
+		if !harvestPins {
+			bridgeRestore, bridgeIdentity = s.injectOpenAICompatBridgeIdentity(c, account, reqBody, promptCacheKey)
+		}
+		defer bridgeRestore()
 		s.applyCodexAccountIdentityOrHarvestPinMap(ctx, account, codexAccountIdentitySource(c, account), apiKeyID, upstreamModel, reqBody)
-		delete(reqBody, "prompt_cache_key")
-		if shouldAutoInjectPromptCacheKeyForCompat(upstreamModel) {
+		if harvestPins {
+			stageCodexFingerprintIDs(c, nil)
+		} else {
+			// 指纹收敛：与 /responses 走同一套解析与暂存。此前 Messages 桥没有这一步，
+			// 同一个账号在两个端点上会报出两套不同的设备身份（体内是按账号命名空间哈希
+			// 客户端原值得到的，而 /responses 是收敛值）。暂存后 buildUpstreamRequest 里的
+			// applyStagedCodexFingerprintHeaders / applyCodexDeviceWireProfile 才能生效。
+			fpIDs := resolveCodexFingerprintIDsWithBody(c, account, nil, reqBody["client_metadata"])
+			if fpIDs != nil {
+				applyCodexFingerprintClientMetadata(reqBody, fpIDs)
+			}
+			stageCodexFingerprintIDs(c, fpIDs)
+		}
+		if !bridgeIdentity {
+			// 基线：桥体不带 prompt_cache_key。双开桥的 prompt_cache_key 是合成身份的一部分（默认 PCK =
+			// session_id），已随 client_metadata 一起被账号隔离派生，与出站头 session-id 同值，保留。
+			delete(reqBody, "prompt_cache_key")
+		}
+		// 双开不跨轮回注 x-codex-turn-state：真客户端的 turn_state 是每轮一个 OnceLock（core/src/client.rs:285-292、
+		// turn_state.rs:140/:152），只在同一轮的重试里复用，新的一轮从不带上一轮的 blob；非双开维持基线的跨轮粘连。
+		if shouldAutoInjectPromptCacheKeyForCompat(upstreamModel) && !codexDeviceWireProfileEnabled(c, account) {
 			compatTurnState = s.getOpenAICompatSessionTurnState(ctx, c, account, promptCacheKey)
 		}
 		// OAuth codex transform forces stream=true upstream, so always use
@@ -360,7 +394,7 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 		// 既有 body/session/conversation 行为。身份头在 post-build 阶段统一恢复。
 		setOpenAICompatMessagesBridgeContext(c, true)
 	}
-	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+	upstreamCtx, releaseUpstreamCtx := gatewayPoolUpstreamContext(ctx, account)
 	var upstreamReq *http.Request
 	if account.Platform == PlatformGrok {
 		upstreamReq, err = buildGrokResponsesRequest(upstreamCtx, c, account, responsesBody, token, grokCacheIdentity, s.cfg, s.settingService)
@@ -374,11 +408,15 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 
 	// Override session_id with a deterministic UUID derived from the isolated
 	// session key, ensuring different API keys produce different upstream sessions.
+	//
+	// 双开账号跳过：真实 Codex 只发连字符会话头，下划线别名是网关的历史形态。写进去
+	// 会让同一账号同时带两套取值不同的会话标识（连字符那套已由收敛按账号+密钥派生，
+	// 隔离性不依赖这里）。打票钉住的会话仍按 ranxi 行为强制写入。
 	if account.Platform != PlatformGrok && promptCacheKey != "" {
 		if session := s.harvestPinnedSessionForModel(ctx, account, upstreamModel); session != "" {
 			upstreamReq.Header.Set("session_id", session)
 			upstreamReq.Header.Del("conversation_id")
-		} else {
+		} else if !codexDeviceWireProfileEnabled(c, account) {
 			isolatedSessionID := generateSessionUUID(isolateOpenAIUpstreamSessionID(apiKeyID, codexAccountIdentitySource(c, account), promptCacheKey))
 			upstreamReq.Header.Set("session_id", isolatedSessionID)
 			if upstreamReq.Header.Get("conversation_id") != "" {
@@ -392,6 +430,11 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 		// originator/OpenAI-Beta 返回 404（issue #3901）。
 		ensureCodexIdentityHeaders(upstreamReq.Header)
 		enforceCodexIdentityHeaders(upstreamReq.Header)
+		// ensureCodexIdentityHeaders 末尾会无条件 Set 回 OpenAI-Beta:responses=experimental，
+		// 把 buildUpstreamRequest 里刚做完的线协议投影抵消掉。双开账号在 /responses 上不发
+		// 该头、在这里发，同一账号就是两种客户端形态。补回投影收口（其内部按双开门控，
+		// 未开投影的账号行为不变）。
+		applyCodexDeviceWireProfile(c, account, upstreamReq.Header, false)
 		logger.L().Debug("openai messages: upstream identity restored",
 			zap.Int64("account_id", account.ID),
 			zap.String("upstream_model", upstreamModel),
@@ -615,6 +658,9 @@ func (s *OpenAIGatewayService) handleAnthropicBufferedStreamingResponse(
 
 	finalResponse, usage, acc, err := s.readOpenAICompatBufferedTerminal(resp, c, "openai messages buffered", requestID)
 	if err != nil {
+		if failure := s.gatewayPoolStreamReadFailure(c, account, false, false, requestID, resp.Header, err); failure != nil {
+			return nil, failure
+		}
 		var readErr *openAICompatBufferedReadError
 		if errors.As(err, &readErr) && readErr != nil {
 			return nil, readErr.cause
@@ -623,6 +669,9 @@ func (s *OpenAIGatewayService) handleAnthropicBufferedStreamingResponse(
 	}
 
 	if finalResponse == nil {
+		if failure := s.gatewayPoolStreamReadFailure(c, account, false, false, requestID, resp.Header, io.ErrUnexpectedEOF); failure != nil {
+			return nil, failure
+		}
 		writeAnthropicError(c, http.StatusBadGateway, "api_error", "Upstream stream ended without a terminal response event")
 		return nil, fmt.Errorf("upstream stream ended without terminal event")
 	}
@@ -965,6 +1014,8 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 	firstChunk := true
 	clientDisconnected := false
 	clientOutputStarted := false
+	pending := newDefaultOpenAIFirstOutputStage()
+	defer func() { _ = pending.Close() }()
 	var streamFailoverErr error
 	var streamNonFailoverErr error
 	terminalEventType := ""
@@ -1134,7 +1185,21 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 					)
 					continue
 				}
+				if account.UsesGatewayPool() && !clientOutputStarted &&
+					!openAIStreamDataStartsClientOutput(payload, eventType) && !isTerminalEvent {
+					if _, err := pending.WriteString(sse); err != nil {
+						streamNonFailoverErr = err
+						return true
+					}
+					continue
+				}
 				writeStreamHeaders()
+				if !clientOutputStarted && pending.Buffered() > 0 {
+					if err := pending.CommitTo(c.Writer); err != nil {
+						clientDisconnected = true
+						return true
+					}
+				}
 				if _, err := fmt.Fprint(c.Writer, sse); err != nil {
 					clientDisconnected = true
 					logger.L().Info("openai messages stream: client disconnected, continuing to drain upstream for billing",
@@ -1145,7 +1210,7 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 				clientOutputStarted = true
 			}
 		}
-		if len(events) > 0 && !clientDisconnected {
+		if len(events) > 0 && !clientDisconnected && clientOutputStarted {
 			c.Writer.Flush()
 		}
 		return isTerminalEvent
@@ -1233,6 +1298,9 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 		}
 		if err := scanner.Err(); err != nil {
 			handleScanErr(err)
+			if retry := s.gatewayPoolStreamReadFailure(c, account, clientOutputStarted, clientDisconnected, requestID, resp.Header, err); retry != nil {
+				return resultWithUsage(), retry
+			}
 			return resultWithUsage(), fmt.Errorf("stream usage incomplete: %w", err)
 		}
 		if frame, ok := parser.Finish(); ok {
@@ -1306,6 +1374,9 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 			}
 			if ev.err != nil {
 				handleScanErr(ev.err)
+				if retry := s.gatewayPoolStreamReadFailure(c, account, clientOutputStarted, clientDisconnected, requestID, resp.Header, ev.err); retry != nil {
+					return resultWithUsage(), retry
+				}
 				return resultWithUsage(), fmt.Errorf("stream usage incomplete: %w", ev.err)
 			}
 			lastDataAt = time.Now()
@@ -1334,6 +1405,9 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 				zap.String("model", originalModel),
 				zap.Duration("interval", streamInterval),
 			)
+			if retry := s.gatewayPoolStreamReadFailure(c, account, clientOutputStarted, clientDisconnected, requestID, resp.Header, context.DeadlineExceeded); retry != nil {
+				return resultWithUsage(), retry
+			}
 			return resultWithUsage(), fmt.Errorf("stream data interval timeout")
 
 		case <-keepaliveCh:
@@ -1345,7 +1419,9 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 			}
 			// Send Anthropic-format ping event
 			writeStreamHeaders()
-			if _, err := fmt.Fprint(c.Writer, "event: ping\ndata: {\"type\":\"ping\"}\n\n"); err != nil {
+			n, err := fmt.Fprint(c.Writer, "event: ping\ndata: {\"type\":\"ping\"}\n\n")
+			recordOpenAIStreamKeepaliveBytes(c, n)
+			if err != nil {
 				// Client disconnected
 				logger.L().Info("openai messages stream: client disconnected during keepalive",
 					zap.String("request_id", requestID),
@@ -1353,7 +1429,6 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 				clientDisconnected = true
 				continue
 			}
-			clientOutputStarted = true
 			c.Writer.Flush()
 		}
 	}
@@ -1361,6 +1436,13 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 
 // writeAnthropicError writes an error response in Anthropic Messages API format.
 func writeAnthropicError(c *gin.Context, statusCode int, errType, message string) {
+	committed := StopOpenAICompactSSEKeepaliveCommitted(c)
+	MarkResponseCommitted(c)
+	if committed {
+		_, _ = fmt.Fprint(c.Writer, buildAnthropicStreamErrorSSE(errType, message))
+		c.Writer.Flush()
+		return
+	}
 	c.JSON(statusCode, gin.H{
 		"type": "error",
 		"error": gin.H{

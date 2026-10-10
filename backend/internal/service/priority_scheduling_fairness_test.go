@@ -28,7 +28,7 @@ func TestPriorityFairDistributionIncludesIdleAccount(t *testing.T) {
 	counts := make(map[int64]int)
 	for i := 0; i < 4000; i++ {
 		req := OpenAIAccountScheduleRequest{SessionHash: fmt.Sprintf("new-session-%d", i), RequestedModel: "gpt-test"}
-		order := scheduler.buildOpenAISelectionOrder(req, openAIAccountLoadPlan{priorityScheduling: true, topK: 1, candidates: pool})
+		order := scheduler.buildOpenAISelectionOrder(context.Background(), req, openAIAccountLoadPlan{priorityScheduling: true, topK: 1, candidates: pool})
 		require.Len(t, order, 4, "all candidates must remain available for slot races")
 		counts[order[0].account.ID]++
 	}

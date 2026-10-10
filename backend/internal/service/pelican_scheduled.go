@@ -259,7 +259,7 @@ func (s *ScheduledTestRunnerService) runPelicanPlan(ctx context.Context, plan *S
 		}
 	}
 	if succeeded && plan.AutoRecover && plan.PelicanConfig.Quality == nil && !isBuiltinCandyPlan(plan.PelicanConfig) && !isOpenAICodexStateProbePlan(plan.PelicanConfig) {
-		s.tryRecoverAccount(saveCtx, plan.AccountID, plan.ID)
+		s.tryRecoverAccount(saveCtx, plan.AccountID, plan.ID, false)
 	}
 	finished := time.Now()
 	if plan.TriggerSource == quality5xxSource {

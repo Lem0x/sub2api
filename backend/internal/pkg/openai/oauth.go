@@ -185,7 +185,7 @@ func base64URLEncode(data []byte) string {
 
 // BuildAuthorizationURL builds the OpenAI OAuth authorization URL
 func BuildAuthorizationURL(state, codeChallenge, redirectURI string) string {
-	return BuildAuthorizationURLForPlatform(state, codeChallenge, redirectURI, OAuthPlatformOpenAI)
+	return BuildAuthorizationURLForPlatform(state, codeChallenge, redirectURI, OAuthPlatformOpenAI, CodexDefaultOriginator)
 }
 
 // BuildExcelAuthorizationURL follows the public add-in's browser PKCE flow.
@@ -202,9 +202,12 @@ func BuildExcelAuthorizationURL(state, codeChallenge string) string {
 }
 
 // BuildAuthorizationURLForPlatform builds authorization URL by platform.
-func BuildAuthorizationURLForPlatform(state, codeChallenge, redirectURI, platform string) string {
+func BuildAuthorizationURLForPlatform(state, codeChallenge, redirectURI, platform, originator string) string {
 	if redirectURI == "" {
 		redirectURI = DefaultRedirectURI
+	}
+	if originator = strings.TrimSpace(originator); originator == "" {
+		originator = CodexDefaultOriginator
 	}
 
 	clientID, codexFlow := OAuthClientConfigByPlatform(platform)
@@ -217,6 +220,7 @@ func BuildAuthorizationURLForPlatform(state, codeChallenge, redirectURI, platfor
 	params.Set("state", state)
 	params.Set("code_challenge", codeChallenge)
 	params.Set("code_challenge_method", "S256")
+	params.Set("originator", originator)
 	// OpenAI specific parameters
 	params.Set("id_token_add_organizations", "true")
 	if codexFlow {

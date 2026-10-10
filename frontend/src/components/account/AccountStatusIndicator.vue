@@ -36,7 +36,7 @@
           >
             {{ statusText }}
           </button>
-          <span class="max-w-[180px] text-center text-[11px] leading-4 text-gray-500 dark:text-gray-400">
+          <span class="max-w-[180px] whitespace-normal break-words text-center text-[11px] leading-4 text-gray-500 dark:text-gray-400">
             {{ tempUnschedRecoveryText }}
           </span>
         </div>
@@ -46,7 +46,7 @@
       </template>
 
       <!-- Error Info Indicator -->
-      <HelpTooltip v-if="hasError && account.error_message" class="!ml-0" width-class="w-72">
+      <HelpTooltip v-if="hasError && display.account.error_message" class="!ml-0" width-class="w-72">
         <template #trigger>
           <svg
             class="h-4 w-4 cursor-help text-red-500 transition-colors hover:text-red-600 dark:text-red-400 dark:hover:text-red-300"
@@ -62,7 +62,7 @@
             />
           </svg>
         </template>
-        <div class="whitespace-pre-wrap break-words">{{ account.error_message }}</div>
+        <div class="whitespace-pre-wrap break-words">{{ display.account.error_message }}</div>
       </HelpTooltip>
 
       <!-- Rate Limit Indicator (429) -->
@@ -75,7 +75,7 @@
             429
           </span>
         </template>
-        {{ t('admin.accounts.status.rateLimitedUntil', { time: formatDateTime(account.rate_limit_reset_at) }) }}
+        {{ t('admin.accounts.status.rateLimitedUntil', { time: formatDateTime(display.account.rate_limit_reset_at) }) }}
       </HelpTooltip>
 
       <!-- Model Status Indicators (普通限流 / 超量请求中) -->
@@ -98,7 +98,7 @@
             >
               <Icon name="exclamationTriangle" size="xs" :stroke-width="2" />
               {{ t('admin.accounts.status.creditsExhausted') }}
-              <span class="text-[10px] opacity-70">{{ formatCountdown(item.reset_at) }}</span>
+              <span class="text-[10px] opacity-70">{{ formatCountdown(item.reset_at, display.now) }}</span>
             </span>
             <!-- 正在走积分（模型限流但积分可用）-->
             <span
@@ -107,7 +107,15 @@
             >
               <span>⚡</span>
               {{ formatScopeName(item.model) }}
-              <span class="text-[10px] opacity-70">{{ formatCountdown(item.reset_at) }}</span>
+              <span class="text-[10px] opacity-70">{{ formatCountdown(item.reset_at, display.now) }}</span>
+            </span>
+            <!-- 降智暂停：该模型在本账号上停着，猎手寻票中（不报倒计时，到期有请求还会再停） -->
+            <span
+              v-else-if="item.kind === 'turn_state_hold'"
+              class="inline-flex items-center gap-1 rounded bg-amber-100 px-1.5 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
+            >
+              <Icon name="exclamationTriangle" size="xs" :stroke-width="2" />
+              {{ t('admin.accounts.status.turnStateHoldShort') }} · {{ formatScopeName(item.model) }}
             </span>
             <!-- 普通模型限流 -->
             <span
@@ -116,15 +124,17 @@
             >
               <Icon name="exclamationTriangle" size="xs" :stroke-width="2" />
               {{ formatScopeName(item.model) }}
-              <span class="text-[10px] opacity-70">{{ formatCountdown(item.reset_at) }}</span>
+              <span class="text-[10px] opacity-70">{{ formatCountdown(item.reset_at, display.now) }}</span>
             </span>
           </template>
           {{
-            item.kind === 'credits_exhausted'
-              ? t('admin.accounts.status.creditsExhaustedUntil', { time: formatDateTimeToMinute(item.reset_at) })
-              : item.kind === 'credits_active'
-                ? t('admin.accounts.status.modelCreditOveragesUntil', { model: formatScopeName(item.model), time: formatDateTimeToMinute(item.reset_at) })
-                : t('admin.accounts.status.modelRateLimitedUntil', { model: formatScopeName(item.model), time: formatDateTimeToMinute(item.reset_at) })
+            item.kind === 'turn_state_hold'
+              ? t('admin.accounts.status.turnStateHold', { model: formatScopeName(item.model) })
+              : item.kind === 'credits_exhausted'
+                ? t('admin.accounts.status.creditsExhaustedUntil', { time: formatDateTimeToMinute(item.reset_at) })
+                : item.kind === 'credits_active'
+                  ? t('admin.accounts.status.modelCreditOveragesUntil', { model: formatScopeName(item.model), time: formatDateTimeToMinute(item.reset_at) })
+                  : t('admin.accounts.status.modelRateLimitedUntil', { model: formatScopeName(item.model), time: formatDateTimeToMinute(item.reset_at) })
           }}
         </HelpTooltip>
       </div>
@@ -139,7 +149,7 @@
             529
           </span>
         </template>
-        {{ t('admin.accounts.status.overloadedUntil', { time: formatTime(account.overload_until) }) }}
+        {{ t('admin.accounts.status.overloadedUntil', { time: formatTime(display.account.overload_until) }) }}
       </HelpTooltip>
     </div>
   </div>
@@ -152,23 +162,41 @@ import HelpTooltip from '@/components/common/HelpTooltip.vue'
 import Icon from '@/components/icons/Icon.vue'
 import type { Account } from '@/types'
 import { formatCountdown, formatDateTime, formatDateTimeToMinute, formatCountdownWithSuffix, formatTime } from '@/utils/format'
+import { TURN_STATE_HOLD_REASON } from '@/utils/turnState'
+import { useNowTicker } from '@/composables/useNowTicker'
+import { usePausedDisplay } from '@/composables/usePausedDisplay'
+import { isGatewayPoolRestReason } from '@/utils/gatewayPoolRest'
 
 const { t } = useI18n()
 
 const props = withDefaults(defineProps<{
   account: Account
   globalBpsEnabled?: boolean
+  gatewayPoolRest?: { active: boolean }
+  gatewayPoolRestPending?: boolean
+  progressPaused?: boolean
 }>(), { globalBpsEnabled: true })
 
 const emit = defineEmits<{
   (e: 'show-temp-unsched', account: Account): void
 }>()
 
+// 会走的「现在」。本组件原先每处都是裸 new Date()：那不是响应式依赖，computed 算过一次
+// 就再也不重算（账号页自动刷新默认是关的），到期的徽标会一直挂着。同一行的猎手行按 30s
+// 一跳判同一条到期时间，这边冻结的话两处会各说各话——用户报过的那个「打架」。
+const wallTime = useNowTicker()
+const display = usePausedDisplay(
+  () => ({ ...props, now: wallTime.value }),
+  () => props.progressPaused === true,
+  () => props.account.id
+)
+const sharedNow = computed(() => display.value.now)
+
 const protocolEnabled = computed(() => props.globalBpsEnabled)
 
 // Keep eligibility aligned with Account.IsExcelBPSEnabled on the backend.
 const isExcelBPSEnabled = computed(() => {
-  const account = props.account
+  const account = display.value.account
   if (account.platform !== 'openai' || account.type !== 'oauth' || account.parent_account_id != null ||
       account.extra?.openai_excel_bps !== true) return false
   const credential = (key: string) => {
@@ -182,23 +210,27 @@ const isExcelBPSEnabled = computed(() => {
 
 // Computed: is rate limited (429)
 const isRateLimited = computed(() => {
-  if (!props.account.rate_limit_reset_at) return false
-  return new Date(props.account.rate_limit_reset_at) > new Date()
+  if (!display.value.account.rate_limit_reset_at) return false
+  return new Date(display.value.account.rate_limit_reset_at).getTime() > sharedNow.value
 })
 
 type AccountModelStatusItem = {
-  kind: 'rate_limit' | 'credits_exhausted' | 'credits_active'
+  kind: 'rate_limit' | 'credits_exhausted' | 'credits_active' | 'turn_state_hold'
   model: string
   reset_at: string
 }
 
-// Computed: active model statuses (普通模型限流 + 积分耗尽 + 走积分中)
+// 降智暂停（openai_turn_state_hold.go）借 model_rate_limits 存，reason 标本功能：显示成
+// 「寻票中」而不是普通限流，也不报倒计时——到期只是内部翻一次标记，有请求还会再停。
+// reason 串与 AccountTurnStateCell 的猎手行共用一份（@/utils/turnState）。
+
+// Computed: active model statuses (普通模型限流 + 积分耗尽 + 走积分中 + 降智暂停)
 const activeModelStatuses = computed<AccountModelStatusItem[]>(() => {
-  const extra = props.account.extra as Record<string, unknown> | undefined
+  const extra = display.value.account.extra as Record<string, unknown> | undefined
   const modelLimits = extra?.model_rate_limits as
-    | Record<string, { rate_limited_at: string; rate_limit_reset_at: string }>
+    | Record<string, { rate_limited_at: string; rate_limit_reset_at: string; reason?: string }>
     | undefined
-  const now = new Date()
+  const now = new Date(sharedNow.value)
   const items: AccountModelStatusItem[] = []
 
   if (!modelLimits) return items
@@ -211,7 +243,9 @@ const activeModelStatuses = computed<AccountModelStatusItem[]>(() => {
   for (const [model, info] of Object.entries(modelLimits)) {
     if (new Date(info.rate_limit_reset_at) <= now) continue
 
-    if (model === 'AICredits') {
+    if (info.reason === TURN_STATE_HOLD_REASON) {
+      items.push({ kind: 'turn_state_hold', model, reset_at: info.rate_limit_reset_at })
+    } else if (model === 'AICredits') {
       // AICredits key → 积分已用尽
       items.push({ kind: 'credits_exhausted', model, reset_at: info.rate_limit_reset_at })
     } else if (allowOverages && !hasActiveAICredits) {
@@ -274,22 +308,22 @@ const formatScopeName = (scope: string): string => {
 
 // Computed: is overloaded (529)
 const isOverloaded = computed(() => {
-  if (!props.account.overload_until) return false
-  return new Date(props.account.overload_until) > new Date()
+  if (!display.value.account.overload_until) return false
+  return new Date(display.value.account.overload_until).getTime() > sharedNow.value
 })
 
 const isRPMPaused = computed(() =>
-  props.account.platform === 'openai' && props.account.type === 'oauth' &&
-  props.account.status === 'active' && props.account.schedulable &&
-  (props.account.base_rpm ?? 0) > 0 &&
-  (props.account.rpm_paused === true ||
-    (props.account.current_rpm ?? 0) >= (props.account.base_rpm ?? 0))
+  display.value.account.platform === 'openai' && display.value.account.type === 'oauth' &&
+  display.value.account.status === 'active' && display.value.account.schedulable &&
+  (display.value.account.base_rpm ?? 0) > 0 &&
+  (display.value.account.rpm_paused === true ||
+    (display.value.account.current_rpm ?? 0) >= (display.value.account.base_rpm ?? 0))
 )
 
 const rpmResumeText = computed(() => {
-  if (props.account.rpm_reset_at) {
+  if (display.value.account.rpm_reset_at) {
     return t('admin.accounts.status.rpmPausedUntil', {
-      time: formatDateTime(new Date(props.account.rpm_reset_at * 1000).toISOString())
+      time: formatDateTime(new Date(display.value.account.rpm_reset_at * 1000).toISOString())
     })
   }
   return t('admin.accounts.status.rpmPausedRetry')
@@ -297,28 +331,30 @@ const rpmResumeText = computed(() => {
 
 // Computed: is temp unschedulable
 const isTempUnschedulable = computed(() => {
-  if (!props.account.temp_unschedulable_until) return false
-  return new Date(props.account.temp_unschedulable_until) > new Date()
+  if (display.value.gatewayPoolRest?.active) return true
+  if (display.value.gatewayPoolRest && isGatewayPoolRestReason(display.value.account.temp_unschedulable_reason)) return false
+  if (!display.value.account.temp_unschedulable_until) return false
+  return new Date(display.value.account.temp_unschedulable_until).getTime() > sharedNow.value
 })
 
 // Computed: has error status
 const hasError = computed(() => {
-  return props.account.status === 'error'
+  return display.value.account.status === 'error'
 })
 
 const isQuotaExceeded = computed(() => {
   const exceeded = (used?: number | null, limit?: number | null) =>
     typeof limit === 'number' && limit > 0 && typeof used === 'number' && used >= limit
   return (
-    exceeded(props.account.quota_used, props.account.quota_limit) ||
-    exceeded(props.account.quota_daily_used, props.account.quota_daily_limit) ||
-    exceeded(props.account.quota_weekly_used, props.account.quota_weekly_limit)
+    exceeded(display.value.account.quota_used, display.value.account.quota_limit) ||
+    exceeded(display.value.account.quota_daily_used, display.value.account.quota_daily_limit) ||
+    exceeded(display.value.account.quota_weekly_used, display.value.account.quota_weekly_limit)
   )
 })
 
 // Computed: countdown text for rate limit (429)
 const rateLimitCountdown = computed(() => {
-  return formatCountdown(props.account.rate_limit_reset_at)
+  return formatCountdown(display.value.account.rate_limit_reset_at, sharedNow.value)
 })
 
 const rateLimitResumeText = computed(() => {
@@ -328,13 +364,17 @@ const rateLimitResumeText = computed(() => {
 
 // Computed: countdown text for overload (529)
 const overloadCountdown = computed(() => {
-  return formatCountdownWithSuffix(props.account.overload_until)
+  return formatCountdownWithSuffix(display.value.account.overload_until, sharedNow.value)
 })
 
 const tempUnschedRecoveryText = computed(() => {
-  if (!isTempUnschedulable.value || !props.account.temp_unschedulable_until) return ''
+  if (display.value.gatewayPoolRest?.active) return t('admin.accounts.tempUnschedulable.poolRestPending')
+  if (!isTempUnschedulable.value || !display.value.account.temp_unschedulable_until) return ''
+  if (isGatewayPoolRestReason(display.value.account.temp_unschedulable_reason)) {
+    return t('admin.accounts.tempUnschedulable.poolRestPending')
+  }
   return t('admin.accounts.status.tempUnschedulableUntil', {
-    time: formatDateTime(props.account.temp_unschedulable_until)
+    time: formatDateTime(display.value.account.temp_unschedulable_until)
   })
 })
 
@@ -346,15 +386,16 @@ const statusClass = computed(() => {
   if (isTempUnschedulable.value) {
     return 'badge-warning'
   }
-  if (props.account.status !== 'active') {
-    return props.account.status === 'error' ? 'badge-danger' : 'badge-gray'
+  if (display.value.account.status !== 'active') {
+    return display.value.account.status === 'error' ? 'badge-danger' : 'badge-gray'
   }
   if (isQuotaExceeded.value) {
     return 'badge-warning'
   }
-  if (!props.account.schedulable) {
+  if (!display.value.account.schedulable) {
     return 'badge-gray'
   }
+  if (display.value.gatewayPoolRestPending) return 'badge-gray'
   return 'badge-success'
 })
 
@@ -366,16 +407,17 @@ const statusText = computed(() => {
   if (isTempUnschedulable.value) {
     return t('admin.accounts.status.tempUnschedulable')
   }
-  if (props.account.status !== 'active') {
-    return t(`admin.accounts.status.${props.account.status}`)
+  if (display.value.account.status !== 'active') {
+    return t(`admin.accounts.status.${display.value.account.status}`)
   }
   if (isQuotaExceeded.value) {
     return t('admin.accounts.status.quotaExceeded')
   }
-  if (!props.account.schedulable) {
+  if (!display.value.account.schedulable) {
     return t('admin.accounts.status.paused')
   }
-  return t(`admin.accounts.status.${props.account.status}`)
+  if (display.value.gatewayPoolRestPending) return t('common.unknown')
+  return t(`admin.accounts.status.${display.value.account.status}`)
 })
 
 const handleTempUnschedClick = () => {

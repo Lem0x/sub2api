@@ -1,6 +1,8 @@
 export default {
     accounts: {
       title: 'Account Management',
+      upstreamRecordingTitle: 'Upstream interaction recording (not recommended)',
+      upstreamRecordingHint: 'Off by default and independent of the gateway pool. Records only this account’s OpenAI/Codex interactions. Sensitive conversation bodies and routing data are encrypted on disk, increasing resource and storage usage; authentication headers are excluded. Records application data actually sent/read without draining canceled or early-closed responses. The per-instance default limit is 2 GiB; collection stops and warns in service logs at capacity. No log viewer is provided; server administrator export is required.',
       description: 'Manage AI platform accounts and credentials',
       createAccount: 'Create Account',
       autoRefresh: 'Auto Refresh',
@@ -258,7 +260,9 @@ export default {
         creditsExhaustedUntil: 'AI Credits exhausted, expected recovery at {time}',
         overloadedUntil: 'Overloaded until {time}',
         viewTempUnschedDetails: 'View temp unschedulable details',
-        tempUnschedulableUntil: 'Resumes {time}'
+        tempUnschedulableUntil: 'Resumes {time}',
+        turnStateHold: 'Degraded pause · {model} is paused on this account while the hunter looks for a ticket; resumes on a hit, re-pauses on the next request after expiry',
+        turnStateHoldShort: 'Degraded'
       },
       columns: {
         name: 'Name',
@@ -278,6 +282,7 @@ export default {
         todayStats: 'Overall Stats',
         groups: 'Groups',
         usageWindows: 'Usage Windows',
+        gateway: 'Gateway',
         proxy: 'Proxy',
         lastUsed: 'Last Used',
         createdAt: 'Created',
@@ -290,7 +295,8 @@ export default {
         ungrouped: 'Ungrouped',
         hint: 'Displayed as "group / base score / sticky bonus". The base score is computed within the current filtered candidate set and includes priority, load, queue depth, error rate, first-token latency, reset window, quota headroom, billing rate, and related factors. The sticky bonus applies only when sticky weighting is enabled for previous_response_id or session_hash. Higher scores are preferred.'
       },
-      usageWindowsHint: '"5h / 7d" are the upstream account\'s official rolling usage windows (e.g. OpenAI ChatGPT, Claude). They are imposed by the upstream provider on the account itself — not configured by sub2api, and unrelated to the models you map. Usage resets automatically once each window rolls over, and the limit cannot be lifted from within sub2api.',
+      gatewayColumnHint: 'Shows the current route ticket, measured full-strength usage and quality/ordinary candidate queues. Green is reserved for a live verified ticket; candidates remain neutral. Queue classification comes from backend evidence for the same member and model, using cached metadata and local cooldowns only. Missing or expired metadata displays — without fetching tickets or probing. Region and gateway names are the pool delivery labels, not proof of the actual upstream landing point.',
+      usageWindowsHint: '"5h / 7d" are the upstream account\'s official rolling usage windows (e.g. OpenAI ChatGPT, Claude). They are imposed by the upstream provider on the account itself — not configured by sub2api, and unrelated to the models you map. Usage resets automatically once each window rolls over, and the limit cannot be lifted from within sub2api. Purple/amber rows are the Codex turn-states currently in effect for this account (one per model); the countdown is the remainder of the one-hour validity from minting, and amber means the ticket looks degraded.',
       ollamaCloud: {
         title: 'Ollama Cloud usage',
         sessionSecurityHint: 'The browser session is encrypted at rest and sent only to the fixed official settings URL.',
@@ -476,8 +482,9 @@ export default {
           openaiNormal: 'OpenAI OAuth RPM normal',
           tieredNormal: 'RPM limit (Tiered) - Normal',
           tieredWarning: 'RPM limit (Tiered) - Approaching limit',
-          tieredStickyOnly: 'RPM limit (Tiered) - Sticky only | Buffer: {buffer}',
-          tieredBlocked: 'RPM limit (Tiered) - Blocked | Buffer: {buffer}',
+          // A bare `|` is vue-i18n's plural separator: t() without a count renders only the first form. Use {'|'}.
+          tieredStickyOnly: "RPM limit (Tiered) - Sticky only {'|'} Buffer: {buffer}",
+          tieredBlocked: "RPM limit (Tiered) - Blocked {'|'} Buffer: {buffer}",
           stickyExemptNormal: 'RPM limit (Sticky Exempt) - Normal',
           stickyExemptWarning: 'RPM limit (Sticky Exempt) - Approaching limit',
           stickyExemptOver: 'RPM limit (Sticky Exempt) - Over limit, sticky only'
@@ -513,6 +520,12 @@ export default {
         accountName: 'Account',
         triggeredAt: 'Triggered At',
         until: 'Until',
+        cooldownUntil: 'Local cooldown resume time',
+        cooldownRemaining: 'Local cooldown remaining',
+        cooldownUnknown: 'Cannot estimate',
+        cooldownFinished: 'Local cooldown expired; waiting for status synchronization',
+        cooldownEstimateHint: 'Resume at the {count}th local cooldown deadline, or after all known gateways when fewer are known. Pool inventory is not rechecked; ticket acquisition and quality verification still apply.',
+        poolRestPending: 'Resumes automatically when local cooldowns expire; pool candidate counts are not rechecked',
         remaining: 'Remaining',
         matchedKeyword: 'Matched Keyword',
         errorMessage: 'Error Details',
@@ -636,6 +649,9 @@ export default {
       recoverStateSuccess: 'Account state recovered successfully',
       recoverStateFailed: 'Failed to recover account state',
       fallbackActive: 'Fallback',
+      cprOutbound: 'CPR exit',
+      cprOutboundHint:
+        'The real exit is set on CPR: {endpoint}. The proxy above only covers the sub2api → CPR hop.',
       fallbackActiveTip: 'Origin proxy {origin} expired',
       revertProxy: 'Revert proxy',
       revertProxySuccess: 'Successfully reverted to original proxy',
@@ -702,6 +718,66 @@ export default {
       },
       // OpenAI specific hints
       openai: {
+        gwpoolCredentialScope: 'The same upstream credentials share verification and a ledger. Different workspace members stay isolated. Local observations and cooldown rules take priority; pool data is advisory.',
+        gatewayQueues: {
+          title: 'Candidate queues',
+          quality: 'Quality',
+          ordinary: 'Ordinary',
+          qualityHint: 'Quality queue: reliable same-member/model observations at the actual idle interval favor full-strength outcomes. Preferred for rotation, not proof of faster recovery.',
+          ordinaryHint: 'Ordinary queue: lower-yield or insufficiently measured candidates retain bounded exploration opportunities.',
+          hint: 'Read-only fresh metadata, excluding local cooldowns and the current or retired ticket gateway. Counts are candidates, not verified tickets; up to 3 names are shown, without promising the next selection order. Missing metadata displays —. No extra acquisition or probing.',
+          candidateHint: '{name} · Candidate, not yet verified',
+          more: '{count} more candidates',
+          empty: 'No candidates',
+          unknown: 'No snapshot'
+        },
+        gatewayRuntime: {
+          durationHours: '{hours}h {minutes}m {seconds}s',
+          live: 'Verified · {gateway} · probe models: {models}',
+          unverified: 'not verified',
+          counts: 'Round verified / attempted {full} / {attempted} tickets',
+          active: 'Current-cycle full-strength use {duration}',
+          activeHint: 'Counts active business intervals on verified tickets, with overlaps counted once. Excludes idle time, ticket preparation, verification and retry waits. Legacy durations are hidden.',
+          duration: '{minutes}m {seconds}s',
+          history: 'Usage history',
+          ended: '{full}/{attempted} tickets · full-strength use {duration} · ended {end}',
+          archived: 'Historical full-use total {duration} / {count} rounds',
+          archivedCounts: 'History: {count} rounds',
+          legacy: 'Legacy · {model} · {full}/{attempted} tickets',
+          legacyArchived: 'Legacy archive · {model} · {count} rounds · {full}/{attempted} tickets',
+          durationIncomplete: ' (some duration unobserved)',
+          incomplete: ' (counts are lower bounds)'
+        },
+        gatewayProgress: {
+          run: 'Verification run #{id}',
+          idle: 'No active verification',
+          pending: 'Awaiting preparation',
+          count: 'Tried {attempt} tickets · {seconds}s',
+          lastCount: 'Last observation: {attempt} / {limit} tickets · {seconds}s',
+          waiting: 'Waiting for a candidate / verification retry',
+          fetching: 'Fetching a candidate ticket',
+          verifying: 'Verifying a candidate ticket',
+          ready: 'Verified · queue paused',
+          recentReady: 'Last verified',
+          exhausted: 'Verification ended · no usable ticket',
+          unknown: 'Verification ended · incomplete (supply, timeout or error)',
+          cancelled: 'Verification ended · request cancelled',
+          rejected: '{count} did not pass',
+          concurrent: '{count} requests in preflight (including this request)',
+          unavailable: 'Live verification progress unavailable'
+        },
+        gwpoolResumeGateways: 'Resume threshold',
+        gwpoolResumeGatewaysDesc: 'After exhaustion, resume at the Nth local cooldown deadline without rechecking pool inventory. Fewer than N waits for all known gateways; no history means no rest. Default 50.',
+        gwpoolCandidatesHint: 'Candidates are deliverable gateways outside local cooldown, not verified tickets. A failed listing is not zero.',
+        gwpoolBulkHint: 'Only checked fields change; others keep each account’s own value. Clear a number for its default. An empty Key keeps the existing key. Runtime statistics are not copied.',
+        gwpoolBulkApply: 'Change: {field}',
+        gwpoolContinuousWait: 'Keep waiting for tickets',
+        gwpoolContinuousWaitDesc: 'Quality protection immediately prepares candidates after a ticket fails, retaining the request until a verified ticket is found or candidates are exhausted. Exhaustion normally enters the existing rest policy. This switch is off by default; enabling it keeps waiting on the same account even after exhaustion. Cooldowns, verification, authentication and rate limits still apply. Cancellation stops waiting; no request means no background preparation.',
+        gwpoolContinuousWaitInactiveLimits: 'When enabled, exhaustion does not enter pool rest; the recovery count is inactive but its saved value remains. When disabled, every eligible candidate is still tried before resting. Client or intermediary hard timeouts can still end the connection.',
+        gwpoolProbeTimeout: 'Maximum ticket verification time (seconds)',
+        gwpoolProbeTimeoutDesc: 'Default 10 seconds, range 1–120. Each preflight A/B or post-response confirmation uses this timeout; the round budget follows its shot count. Timeouts are unknown failures, not degradation. All quality probes use Luna without changing the business model.',
+        gwpoolPrepareRetries: 'Recovery attempts',
+        gwpoolPrepareRetriesDesc: 'Default 0: no extra retries. Optional shared recovery for retryable ticket-fetch or verification failures before business dispatch. Failed tickets enter cooldown once attempts are exhausted. Never replays business requests.',
         baseUrlHint: 'Leave default for official OpenAI API',
         prismBrowser: 'Use Prism browser protocol automatically',
         prismBrowserDesc: 'Uses this OpenAI OAuth account with the server-managed Prism adapter. No separate credentials are needed. Supports text for these four models and client function/custom tools for 6.1 Sol.',
@@ -760,6 +836,9 @@ export default {
         copilotSDKDesc: 'Preserve native Codex tools and cancel SDK turns on disconnect. Use a dedicated group with one sidecar account; Base URL and API Key belong to the sidecar.',
         oauthPassthroughDesc:
           'When enabled, this OpenAI account uses automatic passthrough: the gateway forwards request/response as-is and only swaps auth, while keeping billing/concurrency/audit and necessary safety filtering.',
+        rawRelay: 'Raw relay (klno)',
+        rawRelayDesc:
+          'When enabled, only auth is swapped: the request goes out with its original bytes (including compression) and all headers, and the upstream status/headers/body come back unchanged. Group policies may still adjust reasoning effort, channel model mapping and Fast. Fails over only when the upstream is entirely unavailable. Meant for accounts whose next hop is another sub2api; account-level model mapping and custom headers do not apply.',
         flattenNamespaces: 'Flatten Codex namespace tools (compatibility)',
         flattenNamespacesDesc:
           'Disabled by default: Codex namespace tool declarations are forwarded as-is on /responses, which is what the ChatGPT Codex backend expects. Enable only when this OAuth account is routed to a relay that rejects namespace tools — flattening renames them to namespace__tool, which breaks models that address collaboration tools as functions.<namespace>.<tool>. Compaction requests always flatten regardless of this switch.',
@@ -832,6 +911,8 @@ export default {
           "Effective only when the switch above is on. When enabled, this account also allows third-party clients that embed the Codex engine over the app-server protocol (e.g. Claude Code's codex plugin); they still pass the global engine-fingerprint gate. OR-combined with the global app-server toggle.",
         codexFingerprintMode: 'Codex fingerprint convergence',
         codexFingerprintModeDesc: 'When multiple users share the same OAuth account, converge device/session identifiers to account-level stable values to reduce upstream-visible device and session count. Off by default (client identifiers pass through as-is); opt in explicitly when needed. Some accounts reported quota shrinkage after enabling convergence, so choose based on your own measurements.',
+        codexFingerprintConvergence: 'Experimental fingerprint convergence (klno)',
+        codexFingerprintConvergenceDesc: "Make this account's outbound identity match a real Codex client on HTTP and WS: forward session-id / thread-id headers, x-client-request-id equals thread-id, drop session_id / conversation_id aliases, derive root_turn_id and related fields consistently, keep UUIDv7. Off means upstream behaviour; enabling rotates the account's session identifiers once.",
         codexFingerprintOff: 'Off (passthrough, default)',
         codexFingerprintDevice: 'Device only',
         codexFingerprintSession: 'Device + Session',
@@ -844,6 +925,12 @@ export default {
         codexTurnTicketMissing: 'No valid ticket; requests remain allowed',
         codexTurnTicketReady: '{time} left',
         codexTurnTicketPaused: 'No 780 ticket; this model is paused',
+        codexUserAgent: 'Codex outbound User-Agent',
+        codexUserAgentDesc: 'Client identity this account reports upstream, shared by HTTP, the WS handshake and quota queries. '
+          + 'Leave empty to use the global setting. Keep it consistent with the real OS of this account\u0027s users: a Windows UA '
+          + 'paired with Linux paths and shell in the request body contradicts itself. The gateway rewrites the version segment '
+          + 'to the effective client version, so the value you type there does not matter.',
+        codexUserAgentPlaceholder: 'Leave empty to use the global setting',
         codexImageTool: 'Codex image bridge policy',
         codexImageToolDesc:
           'Controls the hosted image_generation bridge and client-declared image tools on Codex /responses text requests. Hosted auto-injection applies only to non-Responses Lite requests. Account policy takes precedence over channel and global settings; standalone image-generation endpoints are unaffected.',
@@ -859,6 +946,180 @@ export default {
         codexImageToolBadgeEnabled: 'Hosted bridge on',
         codexImageToolBadgeDisabled: 'No hosted injection',
         codexImageToolBadgeBlock: 'Client image tools stripped',
+        gwpool: 'Use the gateway pool for Codex routing',
+        gwpoolManualRetry: 'Clear cooldowns',
+        gwpoolManualRetryPending: 'Processing…',
+        gwpoolManualRetryHint: 'Clear only local cooldowns, backoff and pool rest. Keep live tickets and history. No ticket fetch or probe is sent; prepare when business traffic arrives. Authentication and upstream rate limits remain.',
+        gwpoolManualRetryFailed: 'Failed to clear local cooldowns',
+        gwpoolManualRetryResult: {
+          cleared: 'Local cooldowns cleared; live tickets and history retained. No verification was started.'
+        },
+        gwpoolDesc:
+          'Fetch route tickets from the pool and reuse them while their cache lease is valid. If no usable ticket is available, this account’s request fails instead of falling back to the old route. Upstream requests that would use WebSocket use HTTP/SSE instead.',
+        gwpoolBaseUrl: 'Gateway pool URL',
+        gwpoolBaseUrlDesc:
+          'Enter the root URL, such as https://pool.0102400.xyz, not an /a/xxxx personal page.',
+        gwpoolConsumerKey: 'Consumer key',
+        gwpoolConsumerKeyPlaceholder: 'Paste the Consumer Key supplied by the pool',
+        gwpoolConsumerKeyKeep: 'Saved — leave blank to keep it',
+        gwpoolConsumerKeyDesc:
+          'Authorizes ticket requests to the pool; this is not a ChatGPT access token. It is not displayed after saving. Leave blank to keep a saved key.',
+        gwpoolAdvanced: 'Advanced: single-operation timeouts',
+        gwpoolGatewayWindow: 'Initial cooldown (s)',
+        gwpoolCooldownResetHours: 'Cooldown backoff reset (hours)',
+        gwpoolCooldownResetDesc: 'Default 24 hours; 0 disables. Returns to the initial cooldown tier, not account quota. Preserves recent contact, history and live tickets; does not immediately release cooldowns.',
+        gwpoolGatewayWindowDesc:
+          'Default 3600 seconds (1 hour); accepts 1–24 hours. Cooldown is learned separately per account × gateway. Expiry permits another attempt; it does not guarantee recovery.',
+        gwpoolFetchTimeout: 'Single pair-fetch timeout (s)',
+        gwpoolFetchTimeoutDesc:
+          'Default 10 seconds. Limits a single ticket-fetch network operation, not the entire candidate verification process.',
+        gwpoolListTimeout: 'Single gateway-list timeout (s)',
+        gwpoolListTimeoutDesc:
+          'Default 2 seconds. Limits the candidate-list request. On failure or timeout, the pool selects a gateway; local cooldown still applies.',
+        gwpoolDetails: 'Cooldown, trigger conditions and troubleshooting',
+        gwpoolCooldownDetails:
+          'Cooldown is tracked per member credential × gateway. Confirmed failure backs off through 1/2/4/6/8/10/12/16/20/24 hours; confirmed recovery ends the cycle. Two successes at the same interval in independent cycles lock it; another failure unlocks it. Network errors do not train it, and pool recommendations do not alter local cooldown.',
+        gwpoolGuardDetails:
+          'Verification is always strict: an inconclusive result or timeout blocks the business request, without calling it degraded. Preflight A/B and post-response confirmation always use Luna; the business model stays unchanged. A/B retrieves state and echoes it. Confirmation uses up to 3 extra requests below 90 seconds of ticket age, or 1 at 90 seconds and above. HTTP 200 with the same or absent state retains the original response; all refreshes discard the route. Probes never send business content. Errors, rate limits and timeouts remain unknown, without learning a degraded cooldown.',
+        gwpoolWarmDetails:
+          'One shared candidate queue per identity; fetching and individual verification have network timeouts. Each request waits independently. Only the last waiter leaving cancels network work; queue progress is retained. Verification uses upstream quota but is not billed as business traffic.',
+        gwpoolErrors: {
+          GWPOOL_SETTING_INVALID: 'Invalid gateway pool setting; check field types and numeric ranges.',
+          GWPOOL_TARGET_INVALID: 'Bulk gateway pool settings require OpenAI OAuth or Setup Token accounts.',
+          GWPOOL_BASE_URL_INVALID:
+            'The gateway pool URL must be an absolute http(s) address, e.g. https://pool.0102400.xyz. Fill in the pool root, not the /a/xxxx page.',
+          GWPOOL_CONSUMER_KEY_REQUIRED:
+            'The gateway pool is enabled on this account, so the consumer key is required. Paste the key the pool issued for this account.'
+        },
+        turnStateHunterEffort: 'Probe reasoning effort',
+        turnStateHunterUsageKey: 'Usage API key ID (blank = no usage log)',
+        turnStateHunterUsageKeyDesc:
+          'When set, every 200 probe is recorded under this key through the standard usage path (type "Hunter probe", billed normally, bumps last-used); input tokens are estimated locally (base prompt included), output is always 0. Use a dedicated key: probes consume its quota/rate limits, and subscription groups need an active subscription.',
+        turnStateRecovery: 'Degradation recovery probe',
+        turnStateRecoveryDesc:
+          "Asks the candy puzzle through the account's own exit at randomized intervals (a healthy model answers 21, a degraded one 29/36); once at least 'successes' of the last 'window' answers are right the account is marked recovered, while 'window' consecutive failures start a cooldown. Independent of the hunter (works with the hunter off), it only records a marker and a log line and never changes any setting. Probing stops once marked, and a natural 312 from real traffic clears the marker.",
+        turnStateRecoveryModel: 'Probe model',
+        turnStateRecoveryModelAuto: 'blank = gpt-5.6-sol',
+        turnStateRecoveryStreak: 'Window (total probes)',
+        turnStateRecoverySuccess: 'Successes needed',
+        turnStateRecoveryEffortDefault: 'default (medium)',
+        turnStateRecoveryCooldown: 'Failure cooldown (hours)',
+        turnStateRecoveryMin: 'Min interval (minutes)',
+        turnStateRecoveryMax: 'Max interval (minutes)',
+        gatewayHistory: {
+          diagnostics: 'Diagnostics',
+          runtimeSummary: 'Probes {requests} · Pending {pending}',
+          probeSource: { foreground: 'Foreground verification', background: 'Background preparation' },
+          probeTotals: '{rounds} rounds / {requests} requests: {full} full, {degraded} degraded, {inconclusive} unknown; mean {seconds}s/round, cumulative {perFull} requests/successful round',
+          feedbackTotals: 'Reports: {sent} sent, {pending} pending, {failed} permanent failures, {discarded} discarded',
+          runtimeHint: 'Cumulative probe attempts only, not business traffic. Unknown is not degraded. These are not a business success rate or measured tokens/cost. Up to 64 queued reports, retained for 7 days while enabled.',
+          empty: 'Gateway -',
+          current: 'Current',
+          seen: '{n} used',
+          // The tooltip's five segments are region-gateway-fullTime-state-verdict, each
+          // carrying only the VALUE and no label: operators scan a column vertically, and
+          // repeating "used within the window, still cooling" on every row pushes the values
+          // that actually need comparing off to the right where they no longer line up.
+          // The long wording stays in gatewayColumnHint and legend, which appear once.
+          // "cooling" carries no information — a whole column of it. Report how many minutes
+          // are left instead (against the local ledger window, 4h by default) so a vertical
+          // scan picks out the one that comes back first.
+          regionHot: 'CD left: {minutes}min',
+          regionCooled: 'retry eligible',
+          regionIdle: 'never used',
+          // Segment 3 is how LONG full strength held (full verdict → degraded verdict),
+          // rendered straight as `180s` with no i18n key. This one is the placeholder when
+          // there is no duration to show: window still running, never verified full, or both
+          // readings landed in one write so the length cannot be measured — same thing to the
+          // reader, so one label.
+          fullUntimed: 'not timed',
+          cooldownFixed: 'fixed {minutes}min',
+          cooldownRecommended: 'pool suggests {minutes}min',
+          legend:
+            '✓ current ticket verified · ! local cooldown · grey retry eligible; historical full does not mean available now',
+          // Two independent numbers, NO subtraction: "landings" comes from this row's ledger
+          // (gateway names touched over the past window), "left in pool" is the current
+          // deliverable listing reconciled against that ledger. The two sets do not nest.
+          windowUsage: 'Cooling {used} · cooled down {cooled}',
+          // Without the pool listing, report only the landings: inventing a number is worse.
+          poolSnapshot: 'Last inventory snapshot: {free} (not live)',
+          windowUsageHint:
+            'Counts follow each recorded gateway\'s cooldown deadline. Unknown timestamps are not counted as cooled down. Expiry permits a retry, but does not guarantee an available ticket or recovered quality.',
+          // Expiry permits a retry; it does not prove recovery.
+          forecast: 'retry-eligible gateways, weighted by observed success: about {minutes} full-strength min/hour',
+          forecastPending: 'One-hour forecast: awaiting comparable samples',
+          forecastNone: 'no landing comes out of cooldown within the hour',
+          forecastHint:
+            'Counted per (account × gateway); do not collapse by region: {units} retry-eligible gateways within one hour. For the latest probe model {model} / {source} / state-echo-v1 and comparable observed resting intervals: count × observed full-strength rate × mean observed ended window, capped at 60 minutes.\n' +
+            'Uses at most 64 local repeat-contact rounds from the last 7 days. Each interval needs {results} conclusive results and {windows} ended windows; unknowns are not failures. No fixed success rate or 183-second fallback. Unfinished windows are omitted from duration, introducing censoring bias. Other rows may have contacts not merged yet.\n' +
+            'An estimate, not guaranteed full-strength time, ticket lifetime or quota. Tickets may be unavailable; existing traffic or warm-up must still confirm recovery.',
+          contactSummary: 'Contacts {count}',
+          contactHint: 'At most 64 rounds from 7 days; the latest 8 are detailed below. Stratified by model, criterion, source, first-contact classification and observed interval; unknowns are excluded from the rate denominator. First means first since local tracking, not never touched upstream. Full-strength duration is an observed ended window, not ticket lifetime.',
+          contactTruncated: 'History is incomplete or was trimmed; missing records do not prove first contact.',
+          contactRate: 'Full {full}/{total}; unknown {unknown}; {windows} ended windows, mean {seconds}s',
+          contactTimes: 'First recorded {first}; last sent {last}; round {round}; observed interval {gap}s',
+          contactWindow: 'Historical full window {seconds}s; latest probe {at} · {model} · {source} · {outcome}',
+          contactStep: 'Sent {sent} · HTTP {status} · state received {state} · echo accepted {echo} · observed gateway {gateway} · {ms}ms (— = no evidence)',
+          contactSources: { foreground: 'foreground probe', background: 'background probe', business: 'business' },
+          contactFirst: { tracked_first: 'first tracked', repeat: 'repeat contact', unknown: 'first unknown' },
+          contactOutcomes: { full: 'full', refreshed: 'state refreshed', unknown: 'inconclusive' },
+          // state-echo verdict (backend openai_gwpool_state_echo.go).
+          verdicts: {
+            full: 'full',
+            fullExpired: 'historically full (not current ticket or cross-model availability)',
+            degraded: 'degraded',
+            none: 'never judged'
+          },
+          regions: {
+            'southeast-asia': 'SE.Asia',
+            'africa': 'Africa',
+            'north-america': 'N.Am',
+            'south-america': 'S.Am',
+            europe: 'EU',
+            'east-asia': 'E.Asia',
+            oceania: 'Ocea',
+            'south-asia': 'S.Asia',
+            'middle-east': 'M.East',
+            unknown: 'Unknown'
+          }
+        },
+        turnStatePool: {
+          empty: 'Turn-state —',
+          starved: 'Turn-state: no ticket, passing through',
+          manualTag: 'manual',
+          observedTag: 'last minted',
+          summary: '{n} model(s) with a live turn-state',
+          summaryObservedOnly: 'no live ticket, {n} reading(s) only',
+          detail: '{model}: {shape} {health}, minted {minted}, expires {expires}',
+          detailPair: ', pair {n}',
+          detailReminted: ', upstream re-minted {n}x',
+          healthy: 'full',
+          degraded: 'suspect',
+          unknown: 'unknown shape',
+          hunterSummary: 'hunter (experimental) {count}/{max} this hour · {next} · {last}',
+          hunterNext: 'next {time}',
+          hunterReady: 'ready',
+          hunterProbing: 'probing',
+          recoverySummary: 'recovery {successes}/{window} right (need {success}) · {next}',
+          recoveryCooling: 'cooling until {time}',
+          recoveryDone: 'recovered · {time}',
+          recoveryResultHit: 'answered {answer}✓',
+          recoveryResultMiss: 'answered {answer}✗',
+          recoveryDetail: "{time} {model} {'@'}{proxy}{exit}: {result}, took {latency}",
+          hunterGateIdle: 'paused: no traffic',
+          hunterGateHeld: 'degraded pause: hunting a ticket',
+          hunterGateFresh: 'ticket still fresh',
+          hunterNeedsAuto: 'hunter inactive: enable automatic takeover first',
+          // A bare `@` is vue-i18n's linked-message prefix and throws in production builds; use {'@'}.
+          hunterLast: "last {result} {'@'}{proxy} {time}",
+          hunterLastNone: 'no probe yet',
+          hunterResultHit: '{chars}✓',
+          hunterResultMiss: '{chars}',
+          hunterResultAnswerHit: '{chars}·answered {answer}✓',
+          hunterResultAnswerMiss: '{chars}·answered {answer}✗',
+          hunterResultError: 'error {status} {error}',
+          hunterDetail: "{time} {model} {'@'}{proxy}{exit}: {result}, took {latency}",
+        },
         compactMode: 'Compact mode',
         compactModeDesc:
           'Controls how this account participates in /responses/compact routing. Auto follows probe results, Force On always allows, Force Off always excludes.',
@@ -1026,7 +1287,7 @@ export default {
         bulkDisableHint: 'Saving will disable header override and clear existing configuration on the selected accounts.',
         bulkReplaceHint: 'Saving will replace the existing header override configuration on all selected accounts with the rows below.',
         bulkEmptyRows: 'Add at least one header row before saving, or turn the toggle off to clear existing configuration.',
-        invalidName: 'Invalid header name (only letters, digits and !#$%&\'*+-.^_`|~ are allowed)',
+        invalidName: "Invalid header name (only letters, digits and !#$%&'*+-.^_`{'|'}~ are allowed)",
         blockedName: 'This header cannot be overridden (auth and connection-control headers are managed by the system)',
         duplicateName: 'Duplicate header name (matching is case-insensitive)',
         invalidValue: 'Invalid header value (control characters are not allowed; max length 8192)',
@@ -1253,6 +1514,24 @@ export default {
         apiKeyHint: 'API Key for the upstream service',
         pleaseEnterBaseUrl: 'Please enter upstream Base URL',
         pleaseEnterApiKey: 'Please enter upstream API Key'
+      },
+      // CPR (codex-proxy-rs) relay
+      cpr: {
+        typeHint: 'codex-proxy-rs relay',
+        baseUrl: 'CPR Gateway URL',
+        baseUrlHint: 'Where codex-proxy-rs listens, e.g. http://127.0.0.1:18081. Required; it never falls back to the official endpoint.',
+        clientKey: 'CPR Client Key',
+        clientKeyHint: 'A key created under "Client Keys" in CPR. It should be bound to a single group containing exactly one CPR account.',
+        accountId: 'CPR Account ID',
+        accountIdHint: 'The account id in CPR (looks like acct_xxx), used to read quota.',
+        adminApiKey: 'CPR Admin API Key',
+        adminApiKeyHint: "CPR's admin API key (starts with admin-), used only to read quota and account status.",
+        adminBaseUrl: 'CPR Admin URL (optional)',
+        adminBaseUrlHint: 'Defaults to the gateway URL when left empty.',
+        baseUrlRequired: 'Please enter the CPR gateway URL',
+        clientKeyRequired: 'Please enter the CPR client key',
+        accountIdRequired: 'Please enter the CPR account ID',
+        adminApiKeyRequired: 'Please enter the CPR admin API key'
       },
       // OAuth flow
       oauth: {
