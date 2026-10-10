@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -153,6 +154,19 @@ func shouldEstimateOpenAIInputTokensLocally(account *Account) bool {
 	if account == nil || account.IsGrok() || account.RoutesProtocolByInbound() || account.Type == AccountTypeUpstream {
 		return true
 	}
+	// CPR 中继：它的路由表（openai/router.rs:21-27）只有 responses / alpha_search /
+	// images / models，**没有 input_tokens**。原来的 `Type != apikey → false` 本意是
+	// "OAuth 走官方端点"，对中继账号是错的——会把 CPR 的 client key 发给 api.openai.com。
+	// 用 Type 而非 IsCPR()：IsCPR() 还要求 platform==openai，平台错配的脏数据
+	// 不该从这里漏回官方端点（下游 buildInputTokensUpstreamRequest 同样按 Type 分流）。
+	if account.Type == AccountTypeCPR {
+		return true
+	}
+	// ChatGPT OAuth / setup-token：access token 没有平台 scope（api.responses.write），官方
+	// input_tokens 必然 401/403；真实 Codex 也从不调这个端点。本地估算，不把 ChatGPT token 发给 api.openai.com。
+	if account.UsesOpenAICodexProtocol() {
+		return true
+	}
 	if account.Type != AccountTypeAPIKey {
 		return false
 	}
@@ -291,6 +305,10 @@ func (s *OpenAIGatewayService) ForwardCountTokensAsAnthropic(
 	if err != nil {
 		writeAnthropicCountTokensError(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
 		return err
+	}
+	if account.UsesOpenAICodexProtocol() {
+		writeOpenAIOAuthInputTokensFallback(c, account, prepared, 0) // 理由见 shouldEstimateOpenAIInputTokensLocally
+		return nil
 	}
 
 	upstreamBody, err := marshalOpenAIUpstreamJSON(prepared.Request)
@@ -434,7 +452,8 @@ func (s *OpenAIGatewayService) buildInputTokensUpstreamRequest(
 	token string,
 ) (*http.Request, error) {
 	targetURL := openaiPlatformAPIInputTokensURL
-	if account.Type == AccountTypeAPIKey {
+	switch account.Type {
+	case AccountTypeAPIKey:
 		if baseURL := account.GetOpenAIBaseURL(); strings.TrimSpace(baseURL) != "" {
 			validatedURL, err := s.validateUpstreamBaseURL(baseURL)
 			if err != nil {
@@ -442,6 +461,17 @@ func (s *OpenAIGatewayService) buildInputTokensUpstreamRequest(
 			}
 			targetURL = buildOpenAIResponsesInputTokensURL(validatedURL)
 		}
+	case AccountTypeCPR:
+		// CPR 中继绝不能回落到官方端点：client key 只对 CPR 网关有效，发给 OpenAI 就是凭据外泄。
+		baseURL := account.GetCPRGatewayBaseURL()
+		if baseURL == "" {
+			return nil, errors.New("cpr account requires credentials.base_url")
+		}
+		validatedURL, err := s.validateUpstreamBaseURL(baseURL)
+		if err != nil {
+			return nil, err
+		}
+		targetURL = buildOpenAIResponsesInputTokensURL(validatedURL)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
@@ -471,6 +501,13 @@ func (s *OpenAIGatewayService) buildInputTokensUpstreamRequest(
 				req.Header.Add(key, v)
 			}
 		}
+	}
+
+	// 上面那段会把客户端自报的 User-Agent 原样拷出去（实测 claude-cli/1.0.60 直达
+	// api.openai.com，2026-09-20 审计）。OAuth / setup-token 账号在别的出站面都收口成
+	// 规范 Codex 身份，这一条不该是例外——accept-language 保留不动。
+	if account.UsesOpenAICodexProtocol() {
+		enforceCodexIdentityHeadersWithUA(req.Header, account.GetOpenAIUserAgent())
 	}
 
 	// 账号级请求头覆写（仅 openai api_key 账号启用时生效；OAuth 路径 no-op）

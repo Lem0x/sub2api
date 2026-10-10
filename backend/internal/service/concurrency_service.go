@@ -369,13 +369,13 @@ func (s *ConcurrencyService) AcquireAccountSlot(ctx context.Context, accountID i
 		return &AcquireResult{
 			Acquired:  true,
 			RequestID: requestID,
-			ReleaseFunc: func() {
+			ReleaseFunc: s.renewableSlotRelease(ctx, "account", accountID, requestID, func() {
 				bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
 				if err := s.cache.ReleaseAccountSlot(bgCtx, accountID, requestID); err != nil {
 					logger.LegacyPrintf("service.concurrency", "Warning: failed to release account slot for %d (req=%s): %v", accountID, requestID, err)
 				}
-			},
+			}),
 		}, nil
 	}
 
@@ -409,13 +409,13 @@ func (s *ConcurrencyService) AcquireUserSlot(ctx context.Context, userID int64, 
 		return &AcquireResult{
 			Acquired:  true,
 			RequestID: requestID,
-			ReleaseFunc: func() {
+			ReleaseFunc: s.renewableSlotRelease(ctx, "user", userID, requestID, func() {
 				bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
 				if err := s.cache.ReleaseUserSlot(bgCtx, userID, requestID); err != nil {
 					logger.LegacyPrintf("service.concurrency", "Warning: failed to release user slot for %d (req=%s): %v", userID, requestID, err)
 				}
-			},
+			}),
 		}, nil
 	}
 
@@ -500,6 +500,10 @@ func (s *ConcurrencyService) TrackAPIKeySlotOwned(ctx context.Context, apiKeyID 
 	}
 
 	release, pause := keepAPIKeySlotState(ctx, cache, apiKeyID, requestID)
+	if ctx != nil {
+		// gwpool 长等待请求登记了续租表时，把同一 slot 纳入请求级续租；否则原样返回。
+		release = s.renewableSlotRelease(ctx, "api_key", apiKeyID, requestID, release)
+	}
 	return requestID, release, pause
 }
 

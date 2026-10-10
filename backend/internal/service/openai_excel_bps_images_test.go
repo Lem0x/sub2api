@@ -52,8 +52,43 @@ func excelBPSImagesUpstream(status int, urls *[]string) *codexModelsHTTPUpstream
 		if req.URL.Host == "bps.openai.com" && status != http.StatusOK {
 			return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"detail":"PRIVATE_UPSTREAM"}`))}, nil
 		}
+		if req.URL.String() == chatgptCodexURL {
+			return excelBPSImagesCodexResponsesSSE(), nil
+		}
 		return openAIImagesJSONResponse(), nil
 	}}
+}
+
+// The Codex fallback (anything BPS does not serve) uses the direct images
+// endpoint only while codexDirectImagesEnabled is on; otherwise it is the
+// /responses image tool. BPS itself does not depend on that switch.
+func excelBPSImagesCodexURL(edits bool) string {
+	if !codexDirectImagesEnabled {
+		return chatgptCodexURL
+	}
+	if edits {
+		return codexDirectImagesEditsURL
+	}
+	return codexDirectImagesURL
+}
+
+func excelBPSImagesCodexEndpoint(edits bool) string {
+	return strings.TrimPrefix(excelBPSImagesCodexURL(edits), "https://chatgpt.com")
+}
+
+func excelBPSImagesCodexTestBanner() string {
+	if !codexDirectImagesEnabled {
+		return "Calling Codex /responses image tool"
+	}
+	return "Calling Codex /images/generations"
+}
+
+func excelBPSImagesCodexResponsesSSE() *http.Response {
+	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(
+			"data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"ig_bps_fallback\",\"type\":\"image_generation_call\",\"result\":\"aGVsbG8=\",\"output_format\":\"png\"}}\n\n" +
+				"data: {\"type\":\"response.completed\",\"response\":{\"created_at\":1710000000,\"tool_usage\":{\"image_gen\":{\"images\":1}},\"output\":[]}}\n\n" +
+				"data: [DONE]\n\n"))}
 }
 
 func TestExcelBPSImagesRequiresExplicitImageModel(t *testing.T) {
@@ -272,8 +307,8 @@ func TestExcelBPSImagesEditsFormatRejectionFallsBackToCodex(t *testing.T) {
 	result, err := svc.ForwardImages(context.Background(), c, excelBPSImagesAccount(), body, parsed, "")
 
 	require.NoError(t, err)
-	require.Equal(t, []string{basispoints.ImagesEditsURL, codexDirectImagesEditsURL}, urls)
-	require.Equal(t, "/backend-api/codex/images/edits", result.UpstreamEndpoint)
+	require.Equal(t, []string{basispoints.ImagesEditsURL, excelBPSImagesCodexURL(true)}, urls)
+	require.Equal(t, excelBPSImagesCodexEndpoint(true), result.UpstreamEndpoint)
 }
 
 func TestExcelBPSImagesFormatRejectionFallsBackToCodex(t *testing.T) {
@@ -290,8 +325,8 @@ func TestExcelBPSImagesFormatRejectionFallsBackToCodex(t *testing.T) {
 			result, err := svc.ForwardImages(context.Background(), c, account, body, parsed, "")
 
 			require.NoError(t, err)
-			require.Equal(t, []string{basispoints.ImagesGenerationsURL, codexDirectImagesURL}, urls)
-			require.Equal(t, "/backend-api/codex/images/generations", result.UpstreamEndpoint)
+			require.Equal(t, []string{basispoints.ImagesGenerationsURL, excelBPSImagesCodexURL(false)}, urls)
+			require.Equal(t, excelBPSImagesCodexEndpoint(false), result.UpstreamEndpoint)
 			require.NotEqual(t, excelBPSImagesEndpoint, GetActualOpenAIUpstreamEndpoint(c))
 			require.False(t, svc.isExcelBPSCoolingDown(account, "gpt-image-2"))
 			require.NotContains(t, rec.Body.String(), "PRIVATE_UPSTREAM")
@@ -321,7 +356,7 @@ func TestExcelBPSImagesStayOnCodexWhenBPSCannotServe(t *testing.T) {
 			_, err = svc.ForwardImages(context.Background(), c, tc.account, body, parsed, "")
 
 			require.NoError(t, err)
-			require.Equal(t, []string{codexDirectImagesURL}, urls)
+			require.Equal(t, []string{excelBPSImagesCodexURL(false)}, urls)
 		})
 	}
 }
@@ -404,12 +439,12 @@ func TestExcelBPSImagesAccountTest(t *testing.T) {
 	}{
 		"bps": {account: excelBPSImagesAccount(), status: http.StatusOK, urls: []string{basispoints.ImagesGenerationsURL},
 			contains: []string{"Calling Excel BPS /images/generations; image model: gpt-image-2"}},
-		"bps rejects format": {account: excelBPSImagesAccount(), status: http.StatusUnprocessableEntity, urls: []string{basispoints.ImagesGenerationsURL, codexDirectImagesURL},
-			contains: []string{"Excel BPS rejected this request format", "Calling Codex /images/generations"}},
+		"bps rejects format": {account: excelBPSImagesAccount(), status: http.StatusUnprocessableEntity, urls: []string{basispoints.ImagesGenerationsURL, excelBPSImagesCodexURL(false)},
+			contains: []string{"Excel BPS rejected this request format", excelBPSImagesCodexTestBanner()}},
 		// Before this change an image model on a BPS account went to the text
 		// BPS test and was sent to /responses.
-		"legacy all models": {account: excelAccount(), status: http.StatusOK, urls: []string{codexDirectImagesURL},
-			contains: []string{"Calling Codex /images/generations"}},
+		"legacy all models": {account: excelAccount(), status: http.StatusOK, urls: []string{excelBPSImagesCodexURL(false)},
+			contains: []string{excelBPSImagesCodexTestBanner()}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var urls []string

@@ -8,7 +8,8 @@ vi.mock('vue-i18n', async () => {
   return {
     ...actual,
     useI18n: () => ({
-      t: (key: string) => key
+      // 带参数的键要把参数拼出来：只回显键名的话，「文案里有没有把模型名放进去」这种断言恒绿。
+      t: (key: string, params?: Record<string, unknown>) => (params ? `${key}:${JSON.stringify(params)}` : key)
     })
   }
 })
@@ -19,6 +20,24 @@ vi.mock('@/utils/format', async () => {
     ...actual,
     formatCountdown: () => '1h'
   }
+})
+
+it('网关池休息不把复评期限写成恢复承诺，普通封禁保持原文案', async () => {
+  const wrapper = mount(AccountStatusIndicator, {
+    props: { account: makeAccount({
+      temp_unschedulable_until: '2099-01-01T00:00:00Z',
+      temp_unschedulable_reason: '网关候选低于10，休息后达到50才恢复'
+    }) },
+    global: { stubs: { Icon: true } }
+  })
+  expect(wrapper.text()).toContain('admin.accounts.tempUnschedulable.poolRestPending')
+  expect(wrapper.text()).not.toContain('admin.accounts.status.tempUnschedulableUntil')
+  expect(wrapper.find('span.whitespace-normal').exists()).toBe(true)
+  await wrapper.setProps({ account: makeAccount({
+    temp_unschedulable_until: '2099-01-01T00:00:00Z', temp_unschedulable_reason: 'ordinary-error'
+  }) })
+  expect(wrapper.text()).toContain('admin.accounts.status.tempUnschedulableUntil')
+  wrapper.unmount()
 })
 
 function makeAccount(overrides: Partial<Account>): Account {
@@ -122,6 +141,42 @@ describe('AccountStatusIndicator', () => {
     await wrapper.setProps({ account: { ...account, current_rpm: 0, rpm_paused: false, rpm_reset_at: undefined } })
     expect(wrapper.text()).not.toContain('admin.accounts.status.rpmPaused')
   })
+
+  it('freezes status and deadlines during blur, including parent updates', async () => {
+    vi.useFakeTimers()
+    const account = makeAccount({ platform: 'openai', extra: { openai_gwpool: true },
+      overload_until: new Date(Date.now() + 60_000).toISOString() })
+    const wrapper = mount(AccountStatusIndicator, { props: { account, gatewayPoolRest: { active: false } } })
+    try {
+      const frame = wrapper.html()
+      await wrapper.setProps({ progressPaused: true })
+      await vi.advanceTimersByTimeAsync(90_000)
+      await wrapper.setProps({ account: { ...account, overload_until: null }, gatewayPoolRest: { active: true } })
+      expect(wrapper.html()).toBe(frame)
+      await wrapper.setProps({ progressPaused: false })
+      expect(wrapper.text()).toContain('admin.accounts.tempUnschedulable.poolRestPending')
+      expect(wrapper.text()).not.toContain('admin.accounts.status.overloaded')
+    } finally { wrapper.unmount(); vi.useRealTimers() }
+  })
+
+  it('keeps real pool rest visible after recheck expiry or generic block clearing', async () => {
+    const account = makeAccount({ platform: 'openai', extra: { openai_gwpool: true },
+      temp_unschedulable_until: '2020-01-01T00:00:00Z',
+      temp_unschedulable_reason: '网关候选低于10，休息后达到40才恢复' })
+    const wrapper = mount(AccountStatusIndicator, {
+      props: { account, gatewayPoolRest: { active: true } },
+      global: { stubs: { Icon: true } }
+    })
+    expect(wrapper.text()).toContain('admin.accounts.status.tempUnschedulable')
+    await wrapper.setProps({ account: { ...account, temp_unschedulable_until: null, temp_unschedulable_reason: null } })
+    expect(wrapper.text()).toContain('admin.accounts.tempUnschedulable.poolRestPending')
+    await wrapper.setProps({ gatewayPoolRest: { active: false } })
+    expect(wrapper.text()).not.toContain('admin.accounts.status.tempUnschedulable')
+    await wrapper.setProps({ gatewayPoolRest: undefined, gatewayPoolRestPending: true })
+    expect(wrapper.text()).toContain('common.unknown')
+    expect(wrapper.text()).not.toContain('admin.accounts.status.active')
+    wrapper.unmount()
+  })
   it('Claude 5 系列模型限流时显示 Opus 和 Sonnet 的短别名', () => {
     const wrapper = mount(AccountStatusIndicator, {
       props: {
@@ -179,6 +234,35 @@ describe('AccountStatusIndicator', () => {
 
     expect(wrapper.find('.badge-warning').text()).toBe('admin.accounts.status.rateLimited')
     expect(wrapper.text()).toContain('admin.accounts.status.rateLimitedAutoResume')
+    expect(wrapper.text()).not.toContain('admin.accounts.status.tempUnschedulable')
+  })
+
+  // 降智暂停是模型级的（model_rate_limits + reason=turn_state_hold）：显示成「寻票中」而不是
+  // 普通模型限流，不报倒计时；账号本身不算临时不可调度。
+  it('降智暂停：按模型显示寻票中，不是普通限流也不是账号级暂停', () => {
+    const wrapper = mount(AccountStatusIndicator, {
+      props: {
+        account: makeAccount({
+          platform: 'openai',
+          extra: {
+            model_rate_limits: {
+              'gpt-6-astra': {
+                rate_limited_at: '2026-03-15T00:00:00Z',
+                rate_limit_reset_at: '2099-03-15T00:00:00Z',
+                reason: 'turn_state_hold'
+              }
+            }
+          }
+        })
+      },
+      // 模型状态提示走 HelpTooltip（Teleport 到 body）；就地渲染以便断言提示文案。
+      global: { stubs: { Icon: true, Teleport: true } }
+    })
+
+    expect(wrapper.text()).toContain('admin.accounts.status.turnStateHoldShort')
+    expect(wrapper.text()).toContain('gpt-6-astra')
+    expect(wrapper.text()).toContain('admin.accounts.status.turnStateHold:{"model":"gpt-6-astra"}')
+    expect(wrapper.text()).not.toContain('admin.accounts.status.modelRateLimitedUntil')
     expect(wrapper.text()).not.toContain('admin.accounts.status.tempUnschedulable')
   })
 

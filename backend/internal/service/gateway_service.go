@@ -694,22 +694,30 @@ type GatewayFailureReason string
 // trigger account failover. Additive metadata keeps existing composite literals
 // source-compatible and preserves their legacy retry-next-account behavior.
 type UpstreamFailoverError struct {
-	StatusCode               int
-	ResponseBody             []byte        // 上游响应体，用于错误透传规则匹配
-	ResponseHeaders          http.Header   // 上游响应头，用于透传 cf-ray/cf-mitigated/content-type 等诊断信息
-	ForceCacheBilling        bool          // Antigravity 粘性会话切换时设为 true
-	RetryableOnSameAccount   bool          // 临时性错误（如 Google 间歇性 400、空响应），应在同一账号上重试 N 次再切换
-	SameAccountRetryDelay    time.Duration // 同账号重试的最小间隔；零值使用 handler 默认值
-	SameAccountRetryDeadline time.Time     // 同账号重试截止时间；零值表示仅受 retryLimit 限制
-	SameAccountRetryMax      int           // 可选的错误级同账号重试上限，低于 handler 默认预算时优先采用
-	RequestScopedTransient   bool          // 故障因素与账号无关（如上游按客户端身份/模型容量降载）：可同账号重试，但不得据此对账号做临时封禁
-	SafeToFailoverAfterWrite bool          // 仅写出 SSE 注释等非语义字节时，仍可在同一客户端流中切换账号
-	Stage                    GatewayFailureStage
-	Scope                    GatewayFailureScope
-	Reason                   GatewayFailureReason
-	NextAccountAction        NextAccountAction
-	ClientStatusCode         int
-	ClientMessage            string
+	SameAccountRetryNotBefore time.Time
+	StatusCode                int
+	ResponseBody              []byte        // 上游响应体，用于错误透传规则匹配
+	ResponseHeaders           http.Header   // 上游响应头，用于透传 cf-ray/cf-mitigated/content-type 等诊断信息
+	ForceCacheBilling         bool          // Antigravity 粘性会话切换时设为 true
+	RetryableOnSameAccount    bool          // 临时性错误（如 Google 间歇性 400、空响应），应在同一账号上重试 N 次再切换
+	SameAccountRetryOnly      bool          // allow a bounded same-account retry even when switching accounts is prohibited
+	SameAccountRetryDelay     time.Duration // 同账号重试的最小间隔；零值使用 handler 默认值
+	SameAccountRetryDeadline  time.Time     // 同账号重试截止时间；零值表示仅受 retryLimit 限制
+	SameAccountRetryMax       int           // 可选的错误级同账号重试上限，低于 handler 默认预算时优先采用
+	RequestScopedTransient    bool          // 故障因素与账号无关（如上游按客户端身份/模型容量降载）：可同账号重试，但不得据此对账号做临时封禁
+	SafeToFailoverAfterWrite  bool          // 仅写出 SSE 注释等非语义字节时，仍可在同一客户端流中切换账号
+	Stage                     GatewayFailureStage
+	Scope                     GatewayFailureScope
+	Reason                    GatewayFailureReason
+	NextAccountAction         NextAccountAction
+	GatewayPoolRotation       bool // availability-only; handler must enforce opt-in and same-group scope
+	GatewayPoolRetry          bool // pre-delivery recovery, bounded by the original request's wait policy
+	ClientStatusCode          int
+	ClientMessage             string
+	// RawRelayResponse：原样中继账号整体不可用。换号耗尽时 handler 把 StatusCode/
+	// ResponseHeaders/ResponseBody 原样写回客户端，不经错误映射与脱敏；WS 下
+	// ResponseBody 是已包好的错误帧，原样发一帧。
+	RawRelayResponse bool
 }
 
 func (e *UpstreamFailoverError) Error() string {
@@ -733,6 +741,13 @@ func (e *UpstreamFailoverError) IsCredentialFailure() bool {
 // except an Excel BPS 429: it only cools the account's BPS route.
 func (e *UpstreamFailoverError) ShouldReportAccountScheduleFailure() bool {
 	if e == nil || e.Reason == ExcelBPSRateLimitedReason || e.Reason == GrokUnknownForbiddenReason {
+		return false
+	}
+	// 降智暂停是网关本地判定（缺 292 就换号），不是账号出错，不进调度器的错误率。
+	// 网关池同理：没票 / 池子挂了 / 判降智说的都是**路由**，这个账号的凭据好好的，
+	// 记进错误率会让池子一抖就把一批健康账号的健康度打下去
+	// （classifyUpstreamTransportError 对 gwpool.ErrPool 的豁免是同一个道理）。
+	if e.Reason == OpenAITurnStateHoldReason || e.Reason == OpenAIGatewayPoolReason {
 		return false
 	}
 	return !e.IsCredentialFailure() || e.Scope == GatewayFailureScopeAccount

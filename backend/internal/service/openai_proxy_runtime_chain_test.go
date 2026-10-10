@@ -102,6 +102,16 @@ func TestRuntimeProxyChainEveryHopMustProveUnsent(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://example.invalid", strings.NewReader("test"))
+			// The gateway layers hand the fallback chain a shallow copy of req, so
+			// make clone failure switchable through the original GetBody closure.
+			var cloneFails bool
+			getBody := req.GetBody
+			req.GetBody = func() (io.ReadCloser, error) {
+				if cloneFails {
+					return nil, errors.New("cannot clone")
+				}
+				return getBody()
+			}
 			var calls int
 			s.httpUpstream = &runtimeFallbackUpstream{do: func(r *http.Request, proxy string, _ int64, _ int) (*http.Response, error) {
 				calls++
@@ -137,7 +147,7 @@ func TestRuntimeProxyChainEveryHopMustProveUnsent(t *testing.T) {
 				case "plugin-sent", "plugin-without-trace":
 					return nil, &PluginTransportError{Message: "connection refused", RequestSent: tc == "plugin-sent"}
 				case "body-clone-fails":
-					req.GetBody = func() (io.ReadCloser, error) { return nil, errors.New("cannot clone") }
+					cloneFails = true
 				}
 				return nil, syscall.ECONNREFUSED
 			}}

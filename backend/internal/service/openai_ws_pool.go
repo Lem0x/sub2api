@@ -16,6 +16,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/upstreamroute"
 	"github.com/Wei-Shaw/sub2api/internal/requestcapture"
+	coderws "github.com/coder/websocket"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -91,6 +92,20 @@ type openAIWSAcquireRequest struct {
 
 type openAIWSHandshakeCompatibilityKey struct {
 	anchorScope         string
+	wsURL               string
+	proxyURL            string
+	userAgent           string
+	originator          string
+	version             string
+	openAIBeta          string
+	acceptLanguage      string
+	chatGPTAccountID    string
+	fedRAMP             string
+	credentialIdentity  string
+	agentRuntimeID      string
+	fingerprintMode     codexFingerprintMode
+	fingerprintSeed     string
+	deviceID            string
 	betaFeatures        string
 	codexInstallationID string
 	sessionIDHyphen     string
@@ -98,7 +113,6 @@ type openAIWSHandshakeCompatibilityKey struct {
 	threadID            string
 	clientRequestID     string
 	codexWindowID       string
-	proxyURL            string
 }
 
 type openAIWSConnLease struct {
@@ -216,6 +230,15 @@ func (l *openAIWSConnLease) WriteJSONWithContextTimeout(ctx context.Context, val
 		return err
 	}
 	return captureWSLeaseWrite(ctx, l.accountID, l.HandshakeHeaders(), value, func() error { return conn.writeJSONWithTimeout(ctx, value, timeout) })
+}
+
+// WriteTextWithContextTimeout 写出已序列化好的 JSON 文本帧（字节原样，见 openAIWSRawTextWriter）。
+func (l *openAIWSConnLease) WriteTextWithContextTimeout(ctx context.Context, payload []byte, timeout time.Duration) error {
+	conn, err := l.activeConn()
+	if err != nil {
+		return err
+	}
+	return conn.writeTextWithTimeout(ctx, payload, timeout)
 }
 
 func (l *openAIWSConnLease) WriteJSONContext(ctx context.Context, value any) error {
@@ -614,6 +637,40 @@ func (c *openAIWSConn) writeJSON(value any, writeCtx context.Context) error {
 	return nil
 }
 
+// writeTextWithTimeout 原样写出文本帧（双开专用）。连接实现不支持原始写时显式失败：退回
+// WriteJSON 会让字节重新经 wsjson 的 json.Encoder（HTML 转义 + 尾部换行），那正是这条路径
+// 要消除的差异，静默降级等于悄悄回归。生产连接 coderOpenAIWSClientConn 有编译期断言。
+func (c *openAIWSConn) writeTextWithTimeout(parent context.Context, payload []byte, timeout time.Duration) error {
+	select {
+	case <-c.closedCh:
+		return errOpenAIWSConnClosed
+	default:
+	}
+	writeCtx := parent
+	if writeCtx == nil {
+		writeCtx = context.Background()
+	}
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		writeCtx, cancel = context.WithTimeout(writeCtx, timeout)
+		defer cancel()
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.ws == nil {
+		return errOpenAIWSConnClosed
+	}
+	raw, ok := c.ws.(openAIWSRawTextWriter)
+	if !ok {
+		return fmt.Errorf("websocket connection %T does not support raw text frames", c.ws)
+	}
+	if err := raw.WriteFrame(writeCtx, coderws.MessageText, payload); err != nil {
+		return err
+	}
+	c.touch()
+	return nil
+}
+
 func (c *openAIWSConn) readMessageWithTimeout(timeout time.Duration) ([]byte, error) {
 	return c.readMessageWithContextTimeout(context.Background(), timeout)
 }
@@ -860,6 +917,10 @@ type openAIWSConnPool struct {
 	cfg *config.Config
 	// 通过接口解耦底层 WS 客户端实现，默认使用 coder/websocket。
 	clientDialer openAIWSClientDialer
+	// cookies 让连接池在握手前回放、握手后收取该账号的 ChatGPT cookie（openai_codex_cookies.go；
+	// 真实客户端的 WSS 握手与 HTTP 共用一只罐）。nil 表示不回放（直接 new 出来的测试池）。
+	cookies          *openAICodexCookieStore
+	recordingGateway *OpenAIGatewayService
 
 	accounts sync.Map // key: int64(accountID), value: *openAIWSAccountPool
 	seq      atomic.Uint64
@@ -1156,6 +1217,9 @@ func (p *openAIWSConnPool) Acquire(ctx context.Context, req openAIWSAcquireReque
 		now := time.Now()
 		lease.idleBefore = lease.conn.idleDuration(now)
 		lease.ageBefore = lease.conn.age(now)
+		if p.recordingGateway != nil {
+			p.recordingGateway.recordOpenAIWSLease(ctx, req.Account, req.WSURL, req.Headers, lease.conn)
+		}
 	}
 	return lease, err
 }
@@ -1169,6 +1233,9 @@ func (p *openAIWSConnPool) acquire(ctx context.Context, req openAIWSAcquireReque
 	}
 	if queueWait == nil {
 		queueWait = &openAIWSAcquireQueueWait{}
+	}
+	if err := requireOpenAIProxyBinding(req.Account, req.ProxyURL); err != nil {
+		return nil, err
 	}
 
 retryAcquire:
@@ -2157,7 +2224,28 @@ func (p *openAIWSConnPool) dialConn(ctx context.Context, req openAIWSAcquireRequ
 	if req.Account != nil {
 		ctx = upstreamroute.WithAccountID(ctx, req.Account.ID)
 	}
-	conn, status, handshakeHeaders, err := p.clientDialer.Dial(ctx, req.WSURL, headers, req.ProxyURL)
+	if p.cookies != nil {
+		if headers == nil {
+			headers = http.Header{}
+		}
+		// 还票闭包恒为 nil：网关池账号的 WS 在 AttachRoute 取票**之前**就被兜底闸拒掉
+		// （ErrGatewayPoolWSIncompatible），这条路上永远没有票可还。
+		if _, err := p.cookies.AttachRoute(ctx, req.Account, req.WSURL, headers); err != nil {
+			return nil, err
+		}
+	}
+	var conn openAIWSClientConn
+	var status int
+	var handshakeHeaders http.Header
+	if p.recordingGateway != nil {
+		conn, status, handshakeHeaders, err = p.recordingGateway.dialRecordedOpenAIWS(ctx, req.Account, req.WSURL, headers, req.ProxyURL, p.clientDialer)
+	} else {
+		conn, status, handshakeHeaders, err = p.clientDialer.Dial(ctx, req.WSURL, headers, req.ProxyURL)
+	}
+	if p.cookies != nil {
+		// 握手响应的 Set-Cookie 不论成败都收：Cloudflare 在 4xx/5xx 上同样下发 __cf_bm / __cflb。
+		p.cookies.Store(req.Account, req.WSURL, handshakeHeaders)
+	}
 	if err != nil {
 		var handshakeErr *openAIWSHandshakeError
 		var responseBody []byte
@@ -2183,9 +2271,8 @@ func (p *openAIWSConnPool) dialConn(ctx context.Context, req openAIWSAcquireRequ
 	accountID := req.Account.ID
 	evict := func() { p.evictConn(accountID, id) }
 	pooledConn.onPeerClosed.Store(&evict)
-	compatibilityRequest := req
-	compatibilityRequest.Headers = headers
-	pooledConn.handshakeCompatibility = openAIWSAcquireCompatibility(compatibilityRequest)
+	req.Headers = headers
+	pooledConn.handshakeCompatibility = openAIWSAcquireCompatibility(req)
 	pooledConn.routingAffinity = normalizeOpenAIWSRoutingAffinity(headers)
 	if req.BindHandshake != nil {
 		pooledConn.turnBinding = req.BindHandshake(headers)
@@ -2349,15 +2436,17 @@ func (p *openAIWSConnPool) dialTimeout() time.Duration {
 	return 10 * time.Second
 }
 
+// openAIWSAcquireCompatibility 在稳定身份键（normalizeOpenAIWSHandshakeCompatibility，含 wsURL/proxyURL）
+// 之上再叠加 ranxi 的锚点作用域（turn admission）。
 func openAIWSAcquireCompatibility(req openAIWSAcquireRequest) openAIWSHandshakeCompatibilityKey {
-	key := normalizeOpenAIWSHandshakeCompatibility(req.Account, req.Headers)
-	key.proxyURL = stringsTrim(req.ProxyURL)
+	key := normalizeOpenAIWSHandshakeCompatibility(req)
 	key.anchorScope = req.AnchorScope
 	return key
 }
 
 func cloneOpenAIWSAcquireRequest(req openAIWSAcquireRequest) openAIWSAcquireRequest {
 	copied := req
+	copied.Account = snapshotOpenAIOutboundAccount(req.Account)
 	copied.Headers = cloneHeader(req.Headers)
 	copied.WSURL = stringsTrim(req.WSURL)
 	copied.ProxyURL = stringsTrim(req.ProxyURL)
@@ -2374,9 +2463,7 @@ func cloneOpenAIWSAcquireRequestPtr(req *openAIWSAcquireRequest) *openAIWSAcquir
 }
 
 func sameOpenAIWSPrewarmTarget(a, b openAIWSAcquireRequest) bool {
-	return stringsTrim(a.WSURL) == stringsTrim(b.WSURL) &&
-		stringsTrim(a.ProxyURL) == stringsTrim(b.ProxyURL) &&
-		normalizeOpenAIWSHandshakeCompatibility(a.Account, a.Headers) == normalizeOpenAIWSHandshakeCompatibility(b.Account, b.Headers)
+	return normalizeOpenAIWSHandshakeCompatibility(a) == normalizeOpenAIWSHandshakeCompatibility(b)
 }
 
 func normalizeOpenAIWSBetaFeatures(headers http.Header) string {
@@ -2404,14 +2491,33 @@ func normalizeOpenAIWSBetaFeatures(headers http.Header) string {
 	return strings.Join(normalized, ",")
 }
 
-func normalizeOpenAIWSHandshakeCompatibility(account *Account, headers http.Header) openAIWSHandshakeCompatibilityKey {
+func normalizeOpenAIWSHandshakeCompatibility(req openAIWSAcquireRequest) openAIWSHandshakeCompatibilityKey {
+	account, headers := req.Account, req.Headers
 	key := openAIWSHandshakeCompatibilityKey{
-		betaFeatures: normalizeOpenAIWSBetaFeatures(headers),
+		wsURL:              stringsTrim(req.WSURL),
+		proxyURL:           stringsTrim(req.ProxyURL),
+		userAgent:          normalizeOpenAIWSStableIdentityHeader(headers, "user-agent"),
+		originator:         normalizeOpenAIWSStableIdentityHeader(headers, "originator"),
+		version:            normalizeOpenAIWSStableIdentityHeader(headers, "version"),
+		openAIBeta:         normalizeOpenAIWSStableIdentityHeader(headers, "openai-beta"),
+		acceptLanguage:     normalizeOpenAIWSStableIdentityHeader(headers, "accept-language"),
+		chatGPTAccountID:   normalizeOpenAIWSStableIdentityHeader(headers, "chatgpt-account-id"),
+		fedRAMP:            normalizeOpenAIWSStableIdentityHeader(headers, "x-openai-fedramp"),
+		credentialIdentity: codexAccountIdentityNamespace(account),
+		betaFeatures:       normalizeOpenAIWSBetaFeatures(headers),
+	}
+	// Bearer tokens, per-dial assertions, turn metadata and routing hints are
+	// intentionally excluded: refreshing those does not change stable identity.
+	if account != nil {
+		key.agentRuntimeID = account.GetCredential("agent_runtime_id")
+		key.deviceID = account.GetOpenAIDeviceID()
 	}
 	mode := activeCodexFingerprintMode(account)
+	key.fingerprintMode = mode
 	if mode == codexFingerprintOff {
 		return key
 	}
+	key.fingerprintSeed, _ = codexFingerprintSeed(account.Extra)
 	key.codexInstallationID = normalizeOpenAIWSStableIdentityHeader(headers, "x-codex-installation-id")
 	if mode == codexFingerprintDevice {
 		return key

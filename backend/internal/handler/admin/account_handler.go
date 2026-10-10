@@ -135,7 +135,7 @@ type CreateAccountRequest struct {
 	Name                    string         `json:"name" binding:"required"`
 	Notes                   *string        `json:"notes"`
 	Platform                string         `json:"platform" binding:"required"`
-	Type                    string         `json:"type" binding:"required,oneof=oauth setup-token apikey upstream bedrock service_account"`
+	Type                    string         `json:"type" binding:"required,oneof=oauth setup-token apikey upstream bedrock service_account cpr"`
 	Credentials             map[string]any `json:"credentials" binding:"required"`
 	Extra                   map[string]any `json:"extra"`
 	ProxyID                 *int64         `json:"proxy_id"`
@@ -156,7 +156,7 @@ type CreateAccountRequest struct {
 type UpdateAccountRequest struct {
 	Name                string         `json:"name"`
 	Notes               *string        `json:"notes"`
-	Type                string         `json:"type" binding:"omitempty,oneof=oauth setup-token apikey upstream bedrock service_account"`
+	Type                string         `json:"type" binding:"omitempty,oneof=oauth setup-token apikey upstream bedrock service_account cpr"`
 	Credentials         map[string]any `json:"credentials"`
 	Extra               map[string]any `json:"extra"`
 	ProxyID             *int64         `json:"proxy_id"`
@@ -1096,6 +1096,18 @@ func (h *AccountHandler) Create(c *gin.Context) {
 		response.ErrorFrom(c, err)
 		return
 	}
+	if err := service.ValidateOpenAITurnStateOverrideExtra(req.Extra); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	if err := service.ValidateOpenAITurnStateAutoExtra(req.Extra); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	if err := service.ValidateOpenAITurnStateHunterExtra(req.Extra); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
 
 	// 确定是否跳过混合渠道检查
 	skipCheck := req.ConfirmMixedChannelRisk != nil && *req.ConfirmMixedChannelRisk
@@ -1235,6 +1247,18 @@ func (h *AccountHandler) Update(c *gin.Context) {
 	// base_rpm 输入校验：负值归零，超过 10000 截断
 	sanitizeExtraBaseRPM(req.Extra)
 	if err := service.ValidateUpstreamRequestIDHeaderExtra(req.Extra); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	if err := service.ValidateOpenAITurnStateOverrideExtra(req.Extra); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	if err := service.ValidateOpenAITurnStateAutoExtra(req.Extra); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	if err := service.ValidateOpenAITurnStateHunterExtra(req.Extra); err != nil {
 		response.ErrorFrom(c, err)
 		return
 	}
@@ -1387,7 +1411,7 @@ func (h *AccountHandler) Test(c *gin.Context) {
 	}
 
 	if h.rateLimitService != nil {
-		if _, err := h.rateLimitService.RecoverAccountAfterSuccessfulTest(c.Request.Context(), accountID); err != nil {
+		if _, err := h.rateLimitService.RecoverAccountAfterSuccessfulTest(c.Request.Context(), accountID, service.AccountTestCredentialsOnly(c)); err != nil {
 			_ = c.Error(err)
 		}
 	}
@@ -1752,6 +1776,18 @@ func (h *AccountHandler) ApplyOAuthCredentials(c *gin.Context) {
 		response.ErrorFrom(c, err)
 		return
 	}
+	if err := service.ValidateOpenAITurnStateOverrideExtra(req.Extra); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	if err := service.ValidateOpenAITurnStateAutoExtra(req.Extra); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	if err := service.ValidateOpenAITurnStateHunterExtra(req.Extra); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
 
 	// Re-auth only returns authentication fields. Preserve account configuration
 	// stored alongside them (for example model_mapping), while allowing the new
@@ -1767,6 +1803,13 @@ func (h *AccountHandler) ApplyOAuthCredentials(c *gin.Context) {
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
+	}
+
+	// 换了 ChatGPT 账号：旧账号铸的 turn-state 票对新凭据是跨凭证域回放，清掉运行态。
+	if service.OpenAITurnStateIdentityChanged(existing, req.Credentials) {
+		if clearErr := h.adminService.ClearOpenAITurnStateRuntimeExtra(ctx, accountID); clearErr != nil {
+			slog.Warn("apply_oauth_credentials.clear_turn_state_failed", "account_id", accountID, "err", clearErr)
+		}
 	}
 
 	// 增量合并 Extra（JSONB key 级 merge，绝不覆盖 base_rpm / window_cost_limit /
@@ -2246,6 +2289,33 @@ func (h *AccountHandler) BatchCreate(c *gin.Context) {
 				})
 				continue
 			}
+			if err := service.ValidateOpenAITurnStateOverrideExtra(item.Extra); err != nil {
+				failed++
+				results = append(results, gin.H{
+					"name":    item.Name,
+					"success": false,
+					"error":   err.Error(),
+				})
+				continue
+			}
+			if err := service.ValidateOpenAITurnStateAutoExtra(item.Extra); err != nil {
+				failed++
+				results = append(results, gin.H{
+					"name":    item.Name,
+					"success": false,
+					"error":   err.Error(),
+				})
+				continue
+			}
+			if err := service.ValidateOpenAITurnStateHunterExtra(item.Extra); err != nil {
+				failed++
+				results = append(results, gin.H{
+					"name":    item.Name,
+					"success": false,
+					"error":   err.Error(),
+				})
+				continue
+			}
 
 			skipCheck := item.ConfirmMixedChannelRisk != nil && *item.ConfirmMixedChannelRisk
 
@@ -2446,6 +2516,18 @@ func (h *AccountHandler) BulkUpdate(c *gin.Context) {
 	// base_rpm 输入校验：负值归零，超过 10000 截断
 	sanitizeExtraBaseRPM(req.Extra)
 	if err := service.ValidateUpstreamRequestIDHeaderExtra(req.Extra); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	if err := service.ValidateOpenAITurnStateOverrideExtra(req.Extra); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	if err := service.ValidateOpenAITurnStateAutoExtra(req.Extra); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	if err := service.ValidateOpenAITurnStateHunterExtra(req.Extra); err != nil {
 		response.ErrorFrom(c, err)
 		return
 	}
@@ -2756,6 +2838,36 @@ func (h *AccountHandler) GetTempUnschedulable(c *gin.Context) {
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
+	}
+
+	isPoolReason := state != nil && (strings.HasPrefix(state.ErrorMessage, "网关候选低于") ||
+		strings.HasPrefix(state.ErrorMessage, "Gateway candidates below "))
+	if state != nil && !isPoolReason && state.UntilUnix > time.Now().Unix() {
+		response.Success(c, gin.H{"active": true, "state": state})
+		return
+	}
+	if reader, ok := h.adminService.(interface {
+		GatewayPoolRuntimeProgress(context.Context, []int64) (map[int64]service.GatewayPoolProgress, error)
+	}); ok {
+		progress, readErr := reader.GatewayPoolRuntimeProgress(c.Request.Context(), []int64{accountID})
+		if readErr != nil {
+			response.Error(c, http.StatusServiceUnavailable, "gateway rest status unavailable")
+			return
+		}
+		if runtime := progress[accountID].Runtime; runtime != nil {
+			if rest := runtime.Rest; rest.Active {
+				display := service.TempUnschedState{RuleIndex: -1, ErrorMessage: rest.Reason}
+				if !rest.ResumeAt.IsZero() {
+					display.UntilUnix = rest.ResumeAt.Unix()
+				}
+				if !rest.StartedAt.IsZero() {
+					display.TriggeredAtUnix = rest.StartedAt.Unix()
+				}
+				response.Success(c, gin.H{"active": true, "gateway_pool_rest": true, "state": display})
+				return
+			}
+			state = nil // a recovered latch overrides a stale generic pool-rest cache
+		}
 	}
 
 	if state == nil || state.UntilUnix <= time.Now().Unix() {

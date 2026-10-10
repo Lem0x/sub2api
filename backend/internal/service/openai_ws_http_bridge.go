@@ -492,12 +492,18 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	upstreamCtx, startDrain, releaseUpstreamCtx := openAIWSDrainContext(ctx)
 	defer releaseUpstreamCtx()
 	buildUpstreamRequest := func(requestBody []byte) (*http.Request, error) {
+		requestCtx := upstreamCtx
+		if account.UsesGatewayPool() {
+			// KlN 网关池：请求直接跟随入站 ctx（同 gatewayPoolUpstreamContext），等票/验票随客户端
+			// 离开即止；其余账号沿用 ranxi 的用量排空上下文（openAIWSDrainContext）。
+			requestCtx = ctx
+		}
 		var upstreamReq *http.Request
 		var buildErr error
 		if account.Platform == PlatformGrok {
-			upstreamReq, buildErr = buildGrokResponsesRequest(upstreamCtx, c, account, requestBody, token, grokCacheIdentity, s.cfg, s.settingService)
+			upstreamReq, buildErr = buildGrokResponsesRequest(requestCtx, c, account, requestBody, token, grokCacheIdentity, s.cfg, s.settingService)
 		} else {
-			upstreamReq, buildErr = s.buildUpstreamRequestOpenAIPassthrough(upstreamCtx, c, account, requestBody, token)
+			upstreamReq, buildErr = s.buildUpstreamRequestOpenAIPassthrough(requestCtx, c, account, requestBody, token)
 		}
 		if buildErr != nil {
 			return nil, buildErr
@@ -575,7 +581,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			if upstreamCtx.Err() != nil {
 				return nil, context.Cause(upstreamCtx)
 			}
-			if turn == 1 {
+			if turn == 1 || account.UsesGatewayPool() {
 				return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, true)
 			}
 			safeErr := sanitizeUpstreamErrorMessage(err.Error())
@@ -625,7 +631,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			if shouldFailover && (turn == 1 || resp.StatusCode == http.StatusTooManyRequests) {
 				return nil, newOpenAIUpstreamFailoverError(resp.StatusCode, resp.Header, respBody, upstreamMsg, false).WithGrokForbiddenPolicy(account)
 			}
-		} else if shouldFailover && (turn == 1 || resp.StatusCode == http.StatusTooManyRequests) {
+		} else if shouldFailover && (turn == 1 || account.UsesGatewayPool() || resp.StatusCode == http.StatusTooManyRequests) {
 			return nil, s.handleFailoverErrorResponsePassthrough(ctx, resp, c, account, body, respBody)
 		}
 		if account.Platform != PlatformGrok && (shouldFailover || shouldCooldownOpenAITransientUpstreamError(resp.StatusCode, respBody)) {
@@ -867,7 +873,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			}
 			// A disconnected client needs this attempt drained for usage, not replayed,
 			// even when only non-semantic heartbeats were delivered.
-			if !clientDisconnected && !wroteDownstream && shouldFailover && (turn == 1 || statusCode == http.StatusTooManyRequests) {
+			if !clientDisconnected && !wroteDownstream && shouldFailover && (turn == 1 || account.UsesGatewayPool() || statusCode == http.StatusTooManyRequests) {
 				if account.Platform == PlatformGrok {
 					return nil, newOpenAIUpstreamFailoverError(statusCode, resp.Header, upstreamMessage, errMessage, false).WithGrokForbiddenPolicy(account)
 				}
@@ -911,7 +917,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		}
 		if !clientDisconnected && !suppressClientMessage {
 			isKeepalive := eventType == "keepalive"
-			stageBeforeSemanticOutput := turn == 1 && account.Platform == PlatformOpenAI && !wroteDownstream
+			stageBeforeSemanticOutput := (turn == 1 || account.UsesGatewayPool()) && account.Platform == PlatformOpenAI && !wroteDownstream
 			commitStagedMessages := !stageBeforeSemanticOutput ||
 				openAIStreamDataStartsClientOutput(string(clientMessage), eventType) ||
 				isOpenAIWSTerminalEvent(eventType)
@@ -1019,7 +1025,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		if upstreamCtx.Err() != nil {
 			return resultWithUsage(), context.Cause(upstreamCtx)
 		}
-		if turn == 1 && !clientDisconnected && !wroteDownstream {
+		if (turn == 1 || account.UsesGatewayPool()) && !clientDisconnected && !wroteDownstream {
 			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, streamErr, true)
 		}
 		return resultWithUsage(), streamErr
@@ -1028,7 +1034,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	if sawDone {
 		terminalErr = errors.New("upstream http bridge stream sent [DONE] before terminal event")
 	}
-	if turn == 1 && !clientDisconnected && !wroteDownstream {
+	if (turn == 1 || account.UsesGatewayPool()) && !clientDisconnected && !wroteDownstream {
 		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, terminalErr, true)
 	}
 	return resultWithUsage(), terminalErr

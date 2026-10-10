@@ -94,7 +94,7 @@ func TestPrioritySchedulingOrderingAndFallback(t *testing.T) {
 	plan := openAIAccountLoadPlan{candidates: candidates, topK: 1}
 	scheduler.applyPriorityScheduling(req, &plan)
 	require.True(t, plan.priorityScheduling)
-	order := scheduler.buildOpenAISelectionOrder(req, plan)
+	order := scheduler.buildOpenAISelectionOrder(context.Background(), req, plan)
 	require.Len(t, order, 3, "overflow remains available if best account loses its slot")
 	require.Equal(t, int64(2), order[0].account.ID, "expensive eligible account must beat cheap degraded account")
 	require.Equal(t, int64(3), order[1].account.ID)
@@ -252,7 +252,7 @@ func TestPriorityExplicitPriorityWithinExperienceTier(t *testing.T) {
 	poor.score = 99
 	s, ok := newDefaultOpenAIAccountScheduler(&OpenAIGatewayService{}, nil).(*defaultOpenAIAccountScheduler)
 	require.True(t, ok)
-	got := s.buildOpenAISelectionOrder(OpenAIAccountScheduleRequest{}, openAIAccountLoadPlan{priorityScheduling: true, topK: 1, candidates: []openAIAccountCandidateScore{b, poor, a}})
+	got := s.buildOpenAISelectionOrder(context.Background(), OpenAIAccountScheduleRequest{}, openAIAccountLoadPlan{priorityScheduling: true, topK: 1, candidates: []openAIAccountCandidateScore{b, poor, a}})
 	require.Equal(t, int64(1), got[0].account.ID)
 	require.Equal(t, int64(2), got[1].account.ID)
 	require.Equal(t, int64(3), got[2].account.ID)

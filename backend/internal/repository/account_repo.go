@@ -74,6 +74,36 @@ var schedulerNeutralExtraKeys = map[string]struct{}{
 	"codex_referral_snapshot":    {},
 	"grok_billing_snapshot":      {},
 	"session_window_utilization": {},
+	// turn-state 自动接管的候选池是运行态数据，上游每铸出一条健康 blob 就写一次，
+	// 不参与调度决策——不放进来的话每次响应都要重建一次调度快照。
+	"openai_turn_state_pool": {},
+	// 每个模型最近一次观测到的 turn-state 形态，所有 Codex 账号的响应路径上都会写
+	// （带节流），纯展示不参与调度。
+	"openai_turn_state_observed": {},
+	// CPR 侧的出站代理端点，跟着额度探测刷新，纯展示不参与调度。
+	"cpr_outbound_proxy": {},
+	// turn-state 猎手的运行态（下次窗口 / 本小时次数 / 最近 10 次），每次探测写一次，
+	// 纯展示不参与调度。配置键 openai_turn_state_hunter 由管理员写，不在此列。
+	"openai_turn_state_hunt": {},
+	// 降智恢复探测的运行态（连胜 / 下次窗口 / 已恢复时刻），每次探测写一次，纯展示不参与调度。
+	// 配置键 openai_turn_state_recovery 由管理员写，不在此列。
+	"openai_turn_state_recovery_state": {},
+	// 这个账号落过哪些网关、当前在哪个（openai_gwpool_gateway_history.go）。用量路径上
+	// 带节流地写，纯展示不参与调度。
+	"openai_gwpool_gateways":        {},
+	"openai_gwpool_metrics":         {},
+	"openai_gwpool_feedback_outbox": {},
+	"openai_gwpool_contacts":        {},
+	// 同一上游身份的历史查询标签；运行态中立键，消费端使用 GetByID / FindByExtraField 新鲜读取。
+	"openai_gwpool_ledger_tag":           {},
+	"openai_gwpool_previous_ledger_tag":  {},
+	"openai_gwpool_usage_rounds":         {},
+	service.GatewayPoolUsageBlockedAtKey: {},
+	"openai_gwpool_usage_tag":            {},
+	"openai_gwpool_usage_previous_tag":   {},
+	"openai_gwpool_rest_state":           {},
+	"openai_gwpool_rest_tag":             {},
+	"openai_gwpool_rest_previous_tag":    {},
 }
 
 const postgresParameterBatchSize = 50000
@@ -528,6 +558,15 @@ func (r *accountRepository) updateAccount(
 	)
 	if err != nil {
 		return translatePersistenceError(err, service.ErrAccountNotFound, nil)
+	}
+	if account.GatewayPoolContinuousWaitEnabled() {
+		cleared, err := clearGatewayPoolContinuousWaitBlock(ctx, client, account.ID)
+		if err != nil {
+			return err
+		}
+		if cleared {
+			account.TempUnschedulableUntil, account.TempUnschedulableReason = nil, ""
+		}
 	}
 	if err := enqueueSchedulerOutbox(ctx, client, service.SchedulerOutboxEventAccountChanged, &account.ID, nil, buildSchedulerGroupPayload(account.GroupIDs)); err != nil {
 		return err
@@ -1614,7 +1653,8 @@ func (r *accountRepository) ListByPlatform(ctx context.Context, platform string)
 			dbaccount.PlatformEQ(platform),
 			dbaccount.StatusEQ(service.StatusActive),
 		).
-		Order(dbent.Asc(dbaccount.FieldPriority)).
+		// 次级按 ID：同 priority 的行没有次级键时顺序随堆序漂移，猎手的跨 tick 游标靠不住。
+		Order(dbent.Asc(dbaccount.FieldPriority), dbent.Asc(dbaccount.FieldID)).
 		All(ctx)
 	if err != nil {
 		return nil, err
@@ -2791,16 +2831,103 @@ func (r *accountRepository) SetOverloaded(ctx context.Context, id int64, until t
 	return nil
 }
 
+// SetGatewayPoolRest persists the recovery latch and scheduling block as one
+// mutation. An active unrelated block retains both its deadline and reason;
+// local cooldown changes may shorten an existing pool-owned deadline.
+func (r *accountRepository) SetGatewayPoolRest(ctx context.Context, id int64, until time.Time, reason string, patch map[string]any) error {
+	data, err := json.Marshal(patch)
+	if err != nil {
+		return err
+	}
+	result, err := r.sql.ExecContext(ctx, `
+		WITH updated AS (
+			UPDATE accounts
+			SET temp_unschedulable_until = CASE
+					WHEN temp_unschedulable_until > NOW()
+						AND COALESCE(temp_unschedulable_reason, '') NOT LIKE '网关候选低于% / Gateway candidates below %'
+						THEN temp_unschedulable_until
+					WHEN temp_unschedulable_reason LIKE '网关候选低于% / Gateway candidates below %' THEN $1
+					ELSE GREATEST(temp_unschedulable_until, $1) END,
+				temp_unschedulable_reason = CASE
+					WHEN temp_unschedulable_until > NOW()
+						AND COALESCE(temp_unschedulable_reason, '') NOT LIKE '网关候选低于% / Gateway candidates below %'
+						THEN temp_unschedulable_reason
+					WHEN temp_unschedulable_reason LIKE '网关候选低于% / Gateway candidates below %'
+						OR temp_unschedulable_until IS NULL OR temp_unschedulable_until < $1 THEN $2
+					ELSE temp_unschedulable_reason END,
+				extra = COALESCE(extra, '{}'::jsonb) || $4::jsonb || jsonb_build_object($5::text, NOW()),
+				updated_at = NOW()
+			WHERE id = $3 AND deleted_at IS NULL
+				AND COALESCE(extra->'openai_gwpool_continuous_wait', 'false'::jsonb) <> 'true'::jsonb
+			RETURNING id
+		)
+		INSERT INTO scheduler_outbox (event_type, account_id, group_id, payload)
+		SELECT $6, updated.id, NULL, NULL FROM updated
+	`, until, reason, id, string(data), service.GatewayPoolUsageBlockedAtKey, service.SchedulerOutboxEventAccountChanged)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return service.ErrAccountNotFound
+	}
+	r.syncSchedulerAccountSnapshot(ctx, id)
+	return nil
+}
+
+// Automatic expiry and the administrator's reset may only remove a pool-owned block.
+// A concurrent auth/provider block remains untouched in this atomic statement.
+func (r *accountRepository) ClearGatewayPoolRest(ctx context.Context, id int64, patch map[string]any) error {
+	data, err := json.Marshal(patch)
+	if err != nil {
+		return err
+	}
+	result, err := r.sql.ExecContext(ctx, `
+		WITH updated AS (
+			UPDATE accounts
+			SET temp_unschedulable_until = CASE WHEN temp_unschedulable_reason LIKE $3
+					THEN NULL ELSE temp_unschedulable_until END,
+				temp_unschedulable_reason = CASE WHEN temp_unschedulable_reason LIKE $3
+					THEN NULL ELSE temp_unschedulable_reason END,
+				extra = COALESCE(extra, '{}'::jsonb) || $2::jsonb,
+				updated_at = NOW()
+			WHERE id = $1 AND deleted_at IS NULL
+			RETURNING id
+		)
+		INSERT INTO scheduler_outbox (event_type, account_id, group_id, payload)
+		SELECT $4, updated.id, NULL, NULL FROM updated
+	`, id, string(data), "网关候选低于% / Gateway candidates below %", service.SchedulerOutboxEventAccountChanged)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return service.ErrAccountNotFound
+	}
+	r.syncSchedulerAccountSnapshot(ctx, id)
+	return nil
+}
+
 func (r *accountRepository) SetTempUnschedulable(ctx context.Context, id int64, until time.Time, reason string) error {
 	result, err := r.sql.ExecContext(ctx, `
 		UPDATE accounts
 		SET temp_unschedulable_until = $1,
 			temp_unschedulable_reason = $2,
+			extra = CASE WHEN platform = 'openai' AND extra->'openai_gwpool' = 'true'::jsonb
+				THEN COALESCE(extra, '{}'::jsonb) || jsonb_build_object($4::text, NOW())
+				ELSE extra END,
 			updated_at = NOW()
 		WHERE id = $3
 			AND deleted_at IS NULL
-			AND (temp_unschedulable_until IS NULL OR temp_unschedulable_until < $1)
-	`, until, reason, id)
+			AND (temp_unschedulable_until IS NULL OR temp_unschedulable_until < $1
+				OR temp_unschedulable_reason LIKE '网关候选低于% / Gateway candidates below %')
+	`, until, reason, id, service.GatewayPoolUsageBlockedAtKey)
 	if err != nil {
 		return err
 	}
@@ -3097,6 +3224,11 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 	if affected == 0 {
 		return service.ErrAccountNotFound
 	}
+	if enabled, _ := updates[service.OpenAIGatewayPoolContinuousWaitKey].(bool); enabled {
+		if _, err := clearGatewayPoolContinuousWaitBlock(ctx, client, id); err != nil {
+			return err
+		}
+	}
 	if durableSchedulerChange {
 		if err := enqueueSchedulerOutbox(ctx, client, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
 			return err
@@ -3118,6 +3250,26 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 		}
 	}
 	return nil
+}
+
+// Called inside the configuration edit's transaction, before its outbox event.
+// Preserve shared rest history and all non-pool blocks; changing this one row
+// must neither recover its ordinary-mode clones nor erase concurrent auth.
+func clearGatewayPoolContinuousWaitBlock(ctx context.Context, client *dbent.Client, id int64) (bool, error) {
+	result, err := client.ExecContext(ctx, `
+		UPDATE accounts
+		SET temp_unschedulable_until = NULL, temp_unschedulable_reason = NULL
+		WHERE id = $1 AND deleted_at IS NULL AND platform = 'openai'
+			AND type IN ('oauth', 'setup-token')
+			AND extra->'openai_gwpool' = 'true'::jsonb
+			AND extra->'openai_gwpool_continuous_wait' = 'true'::jsonb
+			AND temp_unschedulable_reason LIKE '网关候选低于% / Gateway candidates below %'
+	`, id)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	return affected > 0, err
 }
 
 // UpdateUpstreamBillingProbeSnapshot stores a probe result only while the

@@ -527,7 +527,7 @@ describe('admin UsageView request ID column visibility', () => {
     )
     expect(localStorage.setItem).toHaveBeenCalledWith(
       'usage-hidden-columns-version',
-      'upstream-request-id-hidden-by-default',
+      'route-gateway-hidden-by-default',
     )
   })
 

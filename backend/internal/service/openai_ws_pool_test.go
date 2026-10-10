@@ -312,6 +312,7 @@ func TestOpenAIWSConnPool_AcquireQueueWaitMetrics(t *testing.T) {
 	accountID := int64(99)
 	account := &Account{ID: accountID, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
 	conn := newOpenAIWSConn("busy", accountID, &openAIWSFakeConn{}, nil)
+	conn.handshakeCompatibility = normalizeOpenAIWSHandshakeCompatibility(openAIWSAcquireRequest{Account: account, WSURL: "wss://example.com/v1/responses"})
 	require.True(t, conn.tryAcquire()) // 占用连接，触发后续排队
 
 	ap := pool.ensureAccountPoolLocked(accountID)
@@ -356,6 +357,9 @@ func TestOpenAIWSConnPool_AcquireAtCapacityWakesWhenAnotherConnReleases(t *testi
 	req := openAIWSAcquireRequest{Account: account, WSURL: "wss://example.com/v1/responses"}
 	target := newOpenAIWSConn("target", accountID, &openAIWSFakeConn{}, nil)
 	other := newOpenAIWSConn("other", accountID, &openAIWSFakeConn{}, nil)
+	// 本分支的握手兼容键含 wsURL / proxyURL，池内连接必须与 req 同键才算可复用。
+	target.handshakeCompatibility = normalizeOpenAIWSHandshakeCompatibility(req)
+	other.handshakeCompatibility = target.handshakeCompatibility
 	require.True(t, target.tryAcquire())
 	require.True(t, other.tryAcquire())
 	// other 上已有一个等待者，新来的等待者会挂到 target 上。
@@ -416,6 +420,9 @@ func TestOpenAIWSConnPool_AcquireAtCapacityWakesWhenCapacityFreedByEviction(t *t
 	req := openAIWSAcquireRequest{Account: account, WSURL: "wss://example.com/v1/responses"}
 	target := newOpenAIWSConn("target", accountID, &openAIWSFakeConn{}, nil)
 	other := newOpenAIWSConn("other", accountID, &openAIWSFakeConn{}, nil)
+	// 本分支的握手兼容键含 wsURL / proxyURL，池内连接必须与 req 同键才算可复用。
+	target.handshakeCompatibility = normalizeOpenAIWSHandshakeCompatibility(req)
+	other.handshakeCompatibility = target.handshakeCompatibility
 	require.True(t, target.tryAcquire())
 	require.True(t, other.tryAcquire())
 	other.waiters.Add(1)
@@ -474,6 +481,9 @@ func TestOpenAIWSConnPool_AcquireAtCapacityCanceledWaiterDoesNotTakeReleasedConn
 	pool := newOpenAIWSConnPool(cfg)
 	target := newOpenAIWSConn("target", accountID, &openAIWSFakeConn{}, nil)
 	other := newOpenAIWSConn("other", accountID, &openAIWSFakeConn{}, nil)
+	// 本分支的握手兼容键含 wsURL / proxyURL，池内连接必须与 req 同键才算可复用。
+	target.handshakeCompatibility = normalizeOpenAIWSHandshakeCompatibility(req)
+	other.handshakeCompatibility = target.handshakeCompatibility
 	require.True(t, target.tryAcquire())
 	require.True(t, other.tryAcquire())
 	other.waiters.Add(1)
@@ -1211,6 +1221,8 @@ func TestOpenAIWSConnPool_AcquireForcePreferredConnQueuesOnPreferredOnly(t *test
 	ap := pool.getOrCreateAccountPool(account.ID)
 	preferredConn := newOpenAIWSConn("preferred_conn", account.ID, &openAIWSFakeConn{}, nil)
 	otherConn := newOpenAIWSConn("other_conn_idle", account.ID, &openAIWSFakeConn{}, nil)
+	preferredConn.handshakeCompatibility = normalizeOpenAIWSHandshakeCompatibility(openAIWSAcquireRequest{Account: account, WSURL: "wss://example.com/v1/responses"})
+	otherConn.handshakeCompatibility = preferredConn.handshakeCompatibility
 	require.True(t, preferredConn.tryAcquire(), "先占用 preferred 连接，触发排队获取")
 	ap.mu.Lock()
 	ap.conns[preferredConn.id] = preferredConn
@@ -1252,6 +1264,8 @@ func TestOpenAIWSConnPool_AcquireForcePreferredConnDirectAndQueueFull(t *testing
 	ap := pool.getOrCreateAccountPool(account.ID)
 	preferredConn := newOpenAIWSConn("preferred_conn_direct", account.ID, &openAIWSFakeConn{}, nil)
 	otherConn := newOpenAIWSConn("other_conn_direct", account.ID, &openAIWSFakeConn{}, nil)
+	preferredConn.handshakeCompatibility = normalizeOpenAIWSHandshakeCompatibility(openAIWSAcquireRequest{Account: account, WSURL: "wss://example.com/v1/responses"})
+	otherConn.handshakeCompatibility = preferredConn.handshakeCompatibility
 	ap.mu.Lock()
 	ap.conns[preferredConn.id] = preferredConn
 	ap.conns[otherConn.id] = otherConn
@@ -2346,6 +2360,7 @@ func TestOpenAIWSConnPool_Acquire_ErrorBranches(t *testing.T) {
 	account2 := &Account{ID: 2002, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
 	ap2 := fullPool.getOrCreateAccountPool(account2.ID)
 	conn := newOpenAIWSConn("queue_full", account2.ID, &openAIWSFakeConn{}, nil)
+	conn.handshakeCompatibility = normalizeOpenAIWSHandshakeCompatibility(openAIWSAcquireRequest{Account: account2, WSURL: "wss://example.com/v1/responses"})
 	require.True(t, conn.tryAcquire())
 	conn.waiters.Store(1)
 	ap2.mu.Lock()

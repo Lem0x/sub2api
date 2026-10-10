@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -37,6 +38,19 @@ var cursorResponsesUnsupportedFields = []string{
 	"stream_options",
 }
 
+// stripChatPromptCacheBreakpoints 删掉各内容段的 prompt_cache_breakpoint：真实 Codex 从不发它，
+// 删掉后转换器也不会再为只剩断点的空文本段生成没有 text 的 input_text。
+// prompt_cache_options 由 Codex 转换按 openAIChatGPTInternalUnsupportedFields 删。
+func stripChatPromptCacheBreakpoints(messages []apicompat.ChatMessage) {
+	for i := range messages {
+		for j := range gjson.GetBytes(messages[i].Content, "#").Int() {
+			if out, err := sjson.DeleteBytes(messages[i].Content, fmt.Sprintf("%d.prompt_cache_breakpoint", j)); err == nil {
+				messages[i].Content = out
+			}
+		}
+	}
+}
+
 // ForwardAsChatCompletions accepts a Chat Completions request body, converts it
 // to OpenAI Responses API format, forwards to the OpenAI upstream, and converts
 // the response back to Chat Completions format.
@@ -58,7 +72,11 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 	body []byte,
 	promptCacheKey string,
 	defaultMappedModel string,
-) (*OpenAIForwardResult, error) {
+) (result *OpenAIForwardResult, err error) {
+	// 网关池的 per-request 标记（openai_gwpool.go）：AttachRoute 往 sink 写，这里 publish 到结果上。
+	// 新增一条能打到 chatgpt.com 的转发入口时要照抄这两行。
+	ctx, gwpoolSink := withOpenAIGatewayPoolSink(ctx, c)
+	defer func() { gwpoolSink.publish(result) }()
 	return s.forwardAsChatCompletions(ctx, c, account, body, promptCacheKey, defaultMappedModel, false)
 }
 
@@ -242,6 +260,9 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 		// Normal path: convert Chat Completions → Responses.
 		// ChatCompletionsToResponses always sets Stream=true (upstream always streams).
 		chatReq.Model = upstreamModel
+		if account.UsesOpenAICodexProtocol() {
+			stripChatPromptCacheBreakpoints(chatReq.Messages)
+		}
 		responsesReq, err = apicompat.ChatCompletionsToResponses(&chatReq)
 		if err != nil {
 			return nil, fmt.Errorf("convert chat completions to responses: %w", err)
@@ -271,6 +292,12 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 	logger.L().Debug("openai chat_completions: model mapping applied", logFields...)
 
 	if account.UsesOpenAICodexProtocol() {
+		// 时区投影必须抢在 applyCodexOAuthTransform* 之前：上游 #7066 在其中删掉
+		// internal_chat_message_metadata_passthrough，而投影正是靠它的 create_time
+		// 定位消息时刻。只有 isResponsesShape 分支会原样转发客户端 body（:237
+		// sjson.SetBytes(body, ...)），其余分支的体由网关现造、带不进该字段，此处为 no-op。
+		// 与 Forward / WS 三处同形，重复执行幂等。
+		responsesBody = rewriteCodexEnvironmentTimezone(c, account, responsesBody)
 		var reqBody map[string]any
 		if err := json.Unmarshal(responsesBody, &reqBody); err != nil {
 			return nil, fmt.Errorf("unmarshal for codex transform: %w", err)
@@ -346,7 +373,7 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 	}
 
 	// 6. Build upstream request
-	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+	upstreamCtx, releaseUpstreamCtx := gatewayPoolUpstreamContext(ctx, account)
 	cancelUpstream := func() {}
 	if clientStream {
 		upstreamCtx, cancelUpstream = context.WithCancel(upstreamCtx)
@@ -527,10 +554,16 @@ func (s *OpenAIGatewayService) handleChatBufferedStreamingResponse(
 
 	finalResponse, usage, acc, err := s.readOpenAICompatBufferedTerminal(resp, c, "openai chat_completions buffered", requestID)
 	if err != nil {
+		if failure := s.gatewayPoolStreamReadFailure(c, account, false, false, requestID, resp.Header, err); failure != nil {
+			return nil, failure
+		}
 		return nil, s.newOpenAICompatBufferedReadFailoverError(c, account, resp, requestID, err)
 	}
 
 	if finalResponse == nil {
+		if failure := s.gatewayPoolStreamReadFailure(c, account, false, false, requestID, resp.Header, io.ErrUnexpectedEOF); failure != nil {
+			return nil, failure
+		}
 		writeChatCompletionsError(c, http.StatusBadGateway, "api_error", "Upstream stream ended without a terminal response event")
 		return nil, fmt.Errorf("upstream stream ended without terminal event")
 	}
@@ -871,7 +904,8 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 					)
 					continue
 				}
-				if !clientOutputStarted && !refusalDetector.ShouldReleaseClientOutput() {
+				if !clientOutputStarted && (!refusalDetector.ShouldReleaseClientOutput() ||
+					(account.UsesGatewayPool() && !openAIStreamDataStartsClientOutput(payload, event.Type))) {
 					pendingSSE = append(pendingSSE, sse)
 					continue
 				}
@@ -1000,6 +1034,10 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 		}
 	}
 	missingTerminalErr := func() (*OpenAIForwardResult, error) {
+		if account.UsesGatewayPool() && !clientOutputStarted && !clientDisconnected {
+			return resultWithUsage(), s.newOpenAIStreamFailoverError(c, account, false, requestID, nil,
+				"OpenAI chat stream ended before a terminal event")
+		}
 		return resultWithUsage(), fmt.Errorf("stream usage incomplete: missing terminal event")
 	}
 	processFrame := func(frame openAICompatSSEFrame) bool {
@@ -1034,6 +1072,9 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 		}
 		if err := scanner.Err(); err != nil {
 			handleScanErr(err)
+			if retry := s.gatewayPoolStreamReadFailure(c, account, clientOutputStarted, clientDisconnected, requestID, resp.Header, err); retry != nil {
+				return resultWithUsage(), retry
+			}
 			if clientDisconnected || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return resultWithUsage(), fmt.Errorf("stream usage incomplete: %w", err)
 			}
@@ -1109,6 +1150,9 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 			}
 			if ev.err != nil {
 				handleScanErr(ev.err)
+				if retry := s.gatewayPoolStreamReadFailure(c, account, clientOutputStarted, clientDisconnected, requestID, resp.Header, ev.err); retry != nil {
+					return resultWithUsage(), retry
+				}
 				if clientDisconnected || errors.Is(ev.err, context.Canceled) || errors.Is(ev.err, context.DeadlineExceeded) {
 					return resultWithUsage(), fmt.Errorf("stream usage incomplete: %w", ev.err)
 				}
@@ -1140,6 +1184,9 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 				zap.String("model", originalModel),
 				zap.Duration("interval", streamInterval),
 			)
+			if retry := s.gatewayPoolStreamReadFailure(c, account, clientOutputStarted, clientDisconnected, requestID, resp.Header, context.DeadlineExceeded); retry != nil {
+				return resultWithUsage(), retry
+			}
 			return resultWithUsage(), fmt.Errorf("stream data interval timeout")
 
 		case <-keepaliveCh:
@@ -1154,7 +1201,9 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 			}
 			// Send SSE comment as keepalive
 			writeStreamHeaders()
-			if _, err := fmt.Fprint(c.Writer, ":\n\n"); err != nil {
+			n, err := fmt.Fprint(c.Writer, ":\n\n")
+			recordOpenAIStreamKeepaliveBytes(c, n)
+			if err != nil {
 				logger.L().Info("openai chat_completions stream: client disconnected during keepalive",
 					zap.String("request_id", requestID),
 				)
@@ -1168,7 +1217,14 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 
 // writeChatCompletionsError writes an error response in OpenAI Chat Completions format.
 func writeChatCompletionsError(c *gin.Context, statusCode int, errType, message string) {
+	committed := StopOpenAICompactSSEKeepaliveCommitted(c)
 	MarkResponseCommitted(c)
+	if committed {
+		payload, _ := json.Marshal(gin.H{"error": gin.H{"type": errType, "message": message}})
+		_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", payload)
+		c.Writer.Flush()
+		return
+	}
 	c.JSON(statusCode, gin.H{
 		"error": gin.H{
 			"type":    errType,

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
@@ -91,6 +92,10 @@ func prismBrowserResponsesURL(baseURL string) string {
 
 // Forward forwards request to OpenAI API
 func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, account *Account, body []byte) (result *OpenAIForwardResult, resultErr error) {
+	// 网关池的 per-request 标记（openai_gwpool.go）：AttachRoute 往 sink 写，这里 publish 到结果上。
+	// 新增一条能打到 chatgpt.com 的转发入口时要照抄这两行。
+	ctx, gwpoolSink := withOpenAIGatewayPoolSink(ctx, c)
+	defer func() { gwpoolSink.publish(result) }()
 	if astraSchedulingAppliesToRequest(s.cfg.AstraRouting(ctx), account, gjson.GetBytes(body, "model").String(), getOpenAIGroupIDFromContext(c)) {
 		if err := s.checkAstraSchedulingRoute(ctx, account); err != nil {
 			return nil, err
@@ -118,6 +123,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	// A failed account attempt must not leave a bypass reason on a later BPS response.
 	c.Writer.Header().Del("X-Codex2API-Basispoints-Bypass")
 	c.Writer.Header().Del("X-Codex2API-Upstream")
+	if account.UsesOpenAIRawRelay() {
+		return s.forwardOpenAIRawRelay(ctx, c, account, body)
+	}
 	if shouldForwardOpenAIResponsesViaChatCompletions(account, body) {
 		SetActualOpenAIUpstreamEndpoint(c, "/v1/chat/completions")
 	}
@@ -133,6 +141,14 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	if _, err := s.prepareCodexAccountIdentitySource(ctx, c, account); err != nil {
 		return nil, err
 	}
+	// 时区投影必须抢在任何规范化之前：上游 #7066 会从 input item 删掉
+	// internal_chat_message_metadata_passthrough（ChatGPT 拒收该字段），而本改写正是
+	// 靠它的 create_time 定位消息时刻、靠 content_item_kinds 判定哪段是 environment_context。
+	// 删掉之后再改写只会静默退化成 no-op。放在 prepareCodexAccountIdentitySource 之后是
+	// 因为双开判定读的就是它准备的身份来源。
+	// 各 builder 里的同名调用保留：图片等路径不经过 Forward；重复执行是幂等的
+	// （证据已被删 → no-op；未被删 → 值已是目标时区，next == text.Raw）。
+	body = rewriteCodexEnvironmentTimezone(c, account, body)
 	startTime := time.Now()
 	// 固定渠道映射后的请求级 canonical body；账号 normalize/strip 不得改写跨 failover hint。
 	canonicalImageIntentBody := body
@@ -211,7 +227,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	} else if toolSchemaSanitized {
 		body = sanitizedToolBody
 	}
-	if account.IsOpenAIOAuthLike() {
+	if account.TargetsChatGPTCodexUpstream() {
 		reasoningBody, reasoningChanged, reasoningErr := normalizeOpenAIResponsesReasoningMode(body, account.GetMappedModel(gjson.GetBytes(body, "model").String()))
 		if reasoningErr != nil {
 			return nil, fmt.Errorf("normalize OpenAI Responses reasoning.mode: %w", reasoningErr)
@@ -242,6 +258,8 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	wsDecision := s.getOpenAIWSProtocolResolver().Resolve(account)
 	// HTTP SSE may opt into the native WS pool on ordinary OAuth accounts.
 	wsDecision = s.resolveOpenAIHTTPWSSSEDecision(c, account, body, wsDecision)
+	// 网关池接管的账号不走 WS 上游：连接复用 60 分钟而满血窗口约 150 秒（openai_gwpool.go）。
+	wsDecision = resolveOpenAIWSDecisionByGatewayPool(wsDecision, account)
 	accelerateHTTPSSE := wsDecision.Reason == openAIOAuthWSSSEAccelerationReason
 	anchorCtx, anchorFinish, anchorErr := s.prepareCodexWSAnchor(ctx, c, account, body)
 	if anchorErr != nil {
@@ -336,7 +354,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		return s.forwardResponsesViaRawChatCompletions(ctx, c, account, body)
 	}
 	SetActualOpenAIUpstreamEndpoint(c, openAIResponsesUpstreamEndpoint)
-	if account.IsOpenAI() && (account.IsOpenAIApiKey() || account.IsOpenAIOAuthLike()) {
+	if account.IsOpenAI() && (account.IsOpenAIApiKey() || account.TargetsChatGPTCodexUpstream()) {
 		normalizedReasoningBody, reasoningChanged, reasoningErr := normalizeOpenAIResponsesReasoningContentReplay(body)
 		if reasoningErr != nil {
 			return nil, fmt.Errorf("normalize OpenAI Responses reasoning content replay: %w", reasoningErr)
@@ -362,7 +380,8 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	}
 
 	compatMessagesBridge := isOpenAICompatMessagesBridgeBody(body)
-	setOpenAICompatMessagesBridgeContext(c, compatMessagesBridge)
+	// 上下文键决定出站头形态（见 buildUpstreamRequest）：双开账号不按请求体嗅探置位，只由 /v1/messages 入口置位。
+	setOpenAICompatMessagesBridgeContext(c, compatMessagesBridge && !codexDeviceWireProfileEnabled(c, account))
 
 	isCodexCLI := openai.IsCodexOfficialClientByHeaders(c.GetHeader("User-Agent"), c.GetHeader("originator")) || (s.cfg != nil && s.cfg.Gateway.ForceCodexCLI)
 	codexImageGenerationExplicitToolPolicy := codexImageGenerationExplicitToolPolicyAllow
@@ -520,10 +539,32 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			upstreamModel = compactModel
 		}
 	}
+	// 真实 Codex Lite 不发 instructions，基础提示在 input 的 developer 消息里，补一份就和真客户端分家。
+	// 只对双开账号上的官方客户端，且渠道与账号都没改写模型（真客户端只为自己请求的模型选 Lite；
+	// 映射后的上游是否接受无 instructions 的 Lite 体离线无法核实；handler 在渠道映射前把原模型记在
+	// ctxkey.Model）。以下照旧补：出站会摘掉 Lite 头的（OAuth 落到 gpt-5.5，见
+	// applyMappedGPT55LiteCompatibility；image-only 模型会被改写成主模型）；/responses/compact。
+	// 原生 v2 压缩回合与普通 Lite 轮次同形，首发不补（会话形态不切换、前缀缓存不断）；它失败后换
+	// 兜底模型重试（兜底默认 gpt-5.5，出站摘 Lite 头），重试体用 liteFallbackInstructions 补回。
+	deviceWireProfile := codexDeviceWireProfileEnabled(c, account)
+	clientModel, _ := c.Request.Context().Value(ctxkey.Model).(string)
+	realCodexLite := isCodexCLI && deviceWireProfile &&
+		isOpenAIResponsesLiteHeader(c.GetHeader(responsesLiteHeader)) &&
+		gjson.GetBytes(body, "input.0.type").String() == "additional_tools" &&
+		(clientModel == "" || clientModel == requestedModel) &&
+		upstreamModel == requestedModel &&
+		(!account.IsOpenAIOAuthLike() || upstreamModel != "gpt-5.5") &&
+		!isOpenAIImageGenerationModel(upstreamModel) &&
+		!isCompactRequest
 	instructions := gjson.GetBytes(body, "instructions")
 	instructionsEmpty := !instructions.Exists() || instructions.Type != gjson.String || strings.TrimSpace(instructions.String()) == ""
+	liteFallbackInstructions := ""
 	if instructionsEmpty && account.UsesOpenAICodexProtocol() && !compatMessagesBridge && !nativeCNResponses {
-		markPatchSet("instructions", defaultCodexSynthInstructions(upstreamModel))
+		if realCodexLite {
+			liteFallbackInstructions = defaultCodexSynthInstructions(upstreamModel)
+		} else {
+			markPatchSet("instructions", defaultCodexSynthInstructions(upstreamModel))
+		}
 	}
 	if billingModel != requestedModel {
 		logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Model mapping applied: %s -> %s (account: %s, isCodexCLI: %v)", requestedModel, billingModel, account.Name, isCodexCLI)
@@ -658,6 +699,8 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			codexResult = applyCodexOAuthTransformWithOptions(decoded, codexOAuthTransformOptions{
 				IsCodexCLI:                          isCodexCLI,
 				IsCompact:                           isCompactRequest,
+				SkipDefaultInstructions:             realCodexLite,
+				PreserveUpstreamCallIDs:             isCodexCLI && deviceWireProfile,
 				OmitPromotedSystemMessagesFromInput: omitPromotedSystemMessages,
 				ResponsesLite:                       responsesLite,
 			})
@@ -671,39 +714,18 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			markDecodedModified()
 		}
 		harvestPins := s.harvestPinsCodexIdentity(ctx, account, upstreamModel)
-		// 带真实 device_id 时补齐 client_metadata 安装标识，与真实 Codex 对齐（compact 形态不同，跳过）。
-		// Harvest-bound traffic must keep the issuing probe's empty metadata;
-		// injecting openai_device_id here is a second installation identity.
-		if !isCompactRequest && !harvestPins && applyCodexClientMetadata(decoded, account) {
-			markDecodedModified()
-		}
+		// 原始 prompt_cache_key 要在账号命名空间改写之前读：改写后体内是账号域的值，
+		// 而头构造要用原值再派生一次（且只派生一次）。
 		if currentClientPromptCacheKey, ok := decoded["prompt_cache_key"].(string); ok {
 			clientPromptCacheKey = currentClientPromptCacheKey
 		}
-		// Account namespace is orthogonal to fingerprint convergence: preserve
-		// each client's identity cardinality, but never reuse it across OAuth
-		// credentials after scheduler failover.
-		if !isCompactRequest && !harvestPins && applyCodexAccountIdentityClientMetadataMap(decoded, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c)) {
+		if harvestPins {
+			// Harvest-bound traffic must keep the issuing probe's empty metadata:
+			// no installation metadata, no account namespace, no fingerprint IDs.
+			// 无条件覆写为 nil：上一账号的收敛 IDs 不得残留（stageCodexFingerprintIDs 注释）。
+			stageCodexFingerprintIDs(c, nil)
+		} else if stageCodexOAuthIdentity(c, account, decoded, isCompactRequest) {
 			markDecodedModified()
-		}
-		stageCodexFingerprintIDs(c, nil)
-		// 指纹收敛：一次性解析收敛 ID，请求体和出站头共享同一份 IDs（保证 turn_id 等随机字段一致）。
-		// fingerprintIDs 在此处解析，后续 buildUpstreamRequest 中使用同一份。
-		if !isCompactRequest && !harvestPins {
-			var clientHeaders http.Header
-			if c != nil && c.Request != nil {
-				clientHeaders = c.Request.Header
-			}
-			fpIDs := resolveCodexFingerprintIDsFromRequest(account, clientHeaders)
-			if fpIDs != nil {
-				if applyCodexFingerprintClientMetadata(decoded, fpIDs) {
-					markDecodedModified()
-				}
-			}
-			// 将 fpIDs 存入 gin context，供 buildUpstreamRequest 中头改写使用。
-			// 无条件覆写（含 nil）：failover 从收敛账号切到 off 账号时，上一
-			// 账号的 IDs 不得残留（stageCodexFingerprintIDs 注释）。
-			stageCodexFingerprintIDs(c, fpIDs)
 		}
 		if codexResult.NormalizedModel != "" {
 			upstreamModel = codexResult.NormalizedModel
@@ -1088,6 +1110,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			if codexWSAnchorFromContext(ctx) == nil && reason == "previous_response_not_found" && recoverPrevResponseNotFound(attempt) {
 				continue
 			}
+			// 这里刻意不做 turn-state 失效归因：WS 路径整条都不参与自动接管
+			// （applyOpenAICodexTurnStateOverrideWSManualOnly 会给上下文打 skip 标记），
+			// 归因函数第一行就会返回，写了也是死代码。
 			if codexWSAnchorFromContext(ctx) == nil && reason == "invalid_encrypted_content" && recoverInvalidEncryptedContent(attempt) {
 				continue
 			}
@@ -1225,6 +1250,11 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	if reqStream && account.Platform == PlatformOpenAI {
 		firstOutputTimeout = s.openAIFirstOutputTimeout(reasoningEffortValue)
 	}
+	var poolFirstOutputBudget *gatewayPoolFirstOutputBudget
+	if firstOutputTimeout > 0 && !isCompactRequest && s.codexCookies.gatewayPoolTakeover(account) {
+		poolFirstOutputBudget = &gatewayPoolFirstOutputBudget{timeout: firstOutputTimeout}
+		ctx = context.WithValue(ctx, gatewayPoolFirstOutputBudgetKey{}, poolFirstOutputBudget)
+	}
 
 	httpInvalidEncryptedContentRetryTried := false
 	compactModelFallbackRetried := false
@@ -1242,9 +1272,11 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 
 		// Build upstream request
-		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+		upstreamCtx, releaseUpstreamCtx := gatewayPoolUpstreamContext(ctx, account)
 		var headerGuard *openAIFirstOutputHeaderGuard
-		if firstOutputTimeout > 0 {
+		// Pool attempts own their header guards inside the replay supervisor.
+		// Protocol repair retains the budget; a new business attempt renews it.
+		if poolFirstOutputBudget == nil && firstOutputTimeout > 0 {
 			upstreamCtx, headerGuard = newOpenAIFirstOutputHeaderGuard(
 				upstreamCtx, releaseUpstreamCtx, startTime.Add(firstOutputTimeout),
 			)
@@ -1333,6 +1365,11 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 					strings.Contains(upstreamMsg, "The encrypted content") &&
 					strings.Contains(upstreamMsg, "could not be verified") &&
 					strings.Contains(upstreamMsg, "could not be decrypted or parsed"))
+			if httpInvalidEncryptedContentRetryTried && resp.StatusCode == http.StatusBadRequest && invalidEncryptedContentError {
+				// 已经剥过一次 encrypted reasoning items 还是 400：排除掉 lineage
+				// 这个主因之后，才轮得到「注入的 turn-state 解不开」这个解释。
+				s.noteOpenAITurnStateRejected(c, account)
+			}
 			if !isControlledExperiment(ctx) && !httpInvalidEncryptedContentRetryTried && resp.StatusCode == http.StatusBadRequest && invalidEncryptedContentError {
 				decoded, decodeErr := ensureReqBody()
 				if decodeErr != nil {
@@ -1355,6 +1392,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 					logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Retrying non-WSv2 request once after invalid_encrypted_content (account: %s)", account.Name)
 					continue
 				}
+				// 请求体里压根没有 encrypted reasoning items，这条 400 就不可能是
+				// lineage 造成的；此时才把账归到本次注入的 turn-state 上。
+				s.noteOpenAITurnStateRejected(c, account)
 				logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Skip non-WSv2 invalid_encrypted_content retry because encrypted reasoning items are missing (account: %s)", account.Name)
 			}
 			if retryBody, reason, changed, retryErr := normalizeOpenAIResponsesRejectedFieldRetryBody(resp.StatusCode, body, respBody); retryErr != nil {
@@ -1369,6 +1409,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			if retryBody, fallbackModel, retry := s.prepareOpenAICompactFallbackRetry(
 				c, account, requestedModel, body, resp.StatusCode, upstreamMsg, respBody, compactModelFallbackRetried,
 			); retry && !isControlledExperiment(ctx) {
+				if retryBody, err = withCompactFallbackInstructions(retryBody, liteFallbackInstructions); err != nil {
+					return nil, fmt.Errorf("set compact fallback instructions: %w", err)
+				}
 				s.appendOpenAICompactFallbackRetryOps(c, account, resp, respBody, upstreamMsg, false)
 				fromModel := strings.TrimSpace(gjson.GetBytes(body, "model").String())
 				body = retryBody
@@ -1447,6 +1490,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 					if retryBody, fallbackModel, retry := s.prepareOpenAICompactFallbackRetry(
 						c, account, requestedModel, body, http.StatusBadRequest, signal.message, signal.payload, compactModelFallbackRetried,
 					); retry {
+						if retryBody, err = withCompactFallbackInstructions(retryBody, liteFallbackInstructions); err != nil {
+							return nil, fmt.Errorf("set compact fallback instructions: %w", err)
+						}
 						s.appendOpenAICompactFallbackRetryOps(c, account, resp, signal.payload, signal.message, false)
 						body = retryBody
 						requestView = newOpenAIRequestView(body)
@@ -1494,6 +1540,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 					if retryBody, fallbackModel, retry := s.prepareOpenAICompactFallbackRetry(
 						c, account, requestedModel, body, http.StatusBadRequest, signal.message, signal.payload, compactModelFallbackRetried,
 					); retry {
+						if retryBody, err = withCompactFallbackInstructions(retryBody, liteFallbackInstructions); err != nil {
+							return nil, fmt.Errorf("set compact fallback instructions: %w", err)
+						}
 						s.appendOpenAICompactFallbackRetryOps(c, account, resp, signal.payload, signal.message, false)
 						body = retryBody
 						requestView = newOpenAIRequestView(body)
@@ -1785,18 +1834,74 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 			}
 			targetURL = buildOpenAIResponsesURLForPlatform(account.Platform, validatedURL)
 		}
+	case AccountTypeCPR:
+		// CPR 中继：必须显式配置 base_url。这里**不能**回落到 openaiPlatformAPIURL——
+		// 那会把 CPR 的 client key 当成 OpenAI API key 发给官方。
+		baseURL := account.GetCPRGatewayBaseURL()
+		if baseURL == "" {
+			return nil, errors.New("cpr account requires credentials.base_url")
+		}
+		validatedURL, err := s.validateUpstreamBaseURL(baseURL)
+		if err != nil {
+			return nil, err
+		}
+		targetURL = buildOpenAIResponsesURL(validatedURL)
 	default:
 		targetURL = openaiPlatformAPIURL
 	}
 	targetURL = appendOpenAIResponsesRequestPathSuffix(targetURL, openAIResponsesRequestPathSuffix(c))
 
+	// 线协议按出站端点判定，而自建图片请求由调用方在本函数返回后改写 URL。
+	// wireTargetURL 只喂给按路径分流的字段序/压缩，不影响 http.NewRequest 用的 targetURL。
+	wireTargetURL := targetURL
+	if override := openAIImagesWireTarget(ctx); override != "" {
+		wireTargetURL = override
+	}
+
 	// DeepSeek / Kimi 原生 Responses 端点为无状态实现：强制 store=false、清除
 	// previous_response_id，避免携带状态字段被上游拒绝。
 	body = normalizeDeepSeekResponsesRequestBody(account, body)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(body))
+	body, err := filterCodexCompactAccessPrograms(c, account, body)
+	if err != nil {
+		return nil, fmt.Errorf("filter compact access programs: %w", err)
+	}
+
+	// codex 0.156 的两处体内形态：guardian 计费标记、turn-metadata 的 model 跟随出站体。
+	body = applyCodexGuardianCreditsRequested(c, account, wireTargetURL, body)
+	body = alignCodexTurnMetadataExecutionBody(c, account, wireTargetURL, body)
+
+	// 顶层键序：只重排，不改任何值（下面的时区改写与压缩仍会动体）。
+	body = applyCodexBodyFieldOrder(c, account, wireTargetURL, body)
+
+	// 双开出站时区收口：真客户端把本机时区与当天日期写进 environment_context，客户端在国内、
+	// 出口在美国时两者矛盾。按出口时区改写这两个标签（openai_codex_wire_timezone.go）。
+	body = rewriteCodexEnvironmentTimezone(c, account, body)
+	// 同一份出口解析结果的第二处投影：web_search 的 user_location 也要跟着改，
+	// 否则出站是"出口时区 + 客户端本机城市"（openai_codex_wire_user_location.go）。
+	body = rewriteCodexWebSearchUserLocation(c, account, body)
+
+	// 趁 body 还是明文，把出站模型名记进本次请求的网关池 sink：queue 档的预热垫话必须用同一个
+	// 模型（后置回声复验沿用本次业务模型），而它跑在传输层、只拿到 *http.Request ——
+	// 到那时双开账号的体已经是 zstd 了，解不出来（openai_gwpool_warm.go 的 gatewayPoolWarmModel）。
+	// 没挂 sink 的路径（猎手探测等）这一行是空操作。
+	openAIGatewayPoolSinkFrom(ctx).noteModel(gjson.GetBytes(body, "model").String())
+	if account.UsesGatewayPool() {
+		ctx = context.WithValue(ctx, gatewayPoolConfirmBodyKey{}, gatewayPoolConfirmBody(body))
+	}
+
+	// 上线字节：双开 /responses 的请求体按真客户端默认做 zstd 压缩（openai_codex_request_compression.go）。
+	// body 仍是明文 JSON，供下面的路由提示与诊断日志读取；每次构造独立压缩。
+	wireBody, contentEncoding, err := compressCodexRequestBody(c, account, wireTargetURL, body)
 	if err != nil {
 		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(wireBody))
+	if err != nil {
+		return nil, err
+	}
+	if contentEncoding != "" {
+		req.Header.Set("Content-Encoding", contentEncoding)
 	}
 	req = req.WithContext(WithHTTPUpstreamProfile(req.Context(), HTTPUpstreamProfileOpenAI))
 
@@ -1833,21 +1938,39 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 	// 客户端回带的 x-codex-turn-state 若已知由其他账号铸造（failover 换号），
 	// 剥离后再出站——异账号 blob 与本账号的（指纹收敛后）出站身份自相矛盾。
 	s.guardOpenAICodexTurnStateEcho(c, account, req.Header)
+	s.applyOpenAICodexTurnStateOverrideHeader(c, account, req.Header)
+	if err := openAITurnStateHoldError(c); err != nil {
+		return nil, err
+	}
+	// 打票门票最后写 x-codex-turn-state：同时启用时 ranxi 的门票覆盖 KlN 的 turn-state 接管值。
 	if err := s.applyOpenAICodexTicket(ctx, account, extractOpenAICodexTicketModel(body), req.Header); err != nil {
 		return nil, err
 	}
 	if account.UsesOpenAICodexProtocol() {
-		compatMessagesBridge := isOpenAICompatMessagesBridgeContext(c) || isOpenAICompatMessagesBridgeBody(body)
+		// 桥的判定：/v1/messages 入口置位的上下文键，或请求体里的桥标记（两层 sub2api 串联时前一层的桥
+		// 请求直连到这里的 /v1/responses）。双开账号不按请求体嗅探：真客户端每条 /responses 都无条件带
+		// originator / version，出站身份不能随请求体内容（<todo-guard> 字面量、anthropic-* 缓存键）变形。
+		compatMessagesBridge := isOpenAICompatMessagesBridgeContext(c) ||
+			(!codexDeviceWireProfileEnabled(c, account) && isOpenAICompatMessagesBridgeBody(body))
 		// 清除客户端透传的 session 头，后续用隔离后的值重新设置，防止跨用户会话碰撞。
 		clientConversationID := strings.TrimSpace(req.Header.Get("conversation_id"))
 		req.Header.Del("conversation_id")
 		req.Header.Del("session_id")
 
+		// 真 Codex 在 HTTP /responses 上从不发 OpenAI-Beta：rust-v0.156.1 里 OPENAI_BETA_HEADER 只写在
+		// client.rs:1320 的 build_websocket_headers（WS 握手）和 doctor.rs:2332（codex doctor 的 WS 探测），
+		// HTTP 与 WS 共用的 build_responses_headers 只写 x-codex-beta-features / x-codex-turn-state。
+		// 所以这条路整条删掉，不是只剥 legacy 值：openai-beta 进了非透传入站白名单之后，客户端给的任何
+		// 非 legacy 值（`responses_websockets=…`、`responses_multi_agent=…`）都会跟着出站，成为一条真
+		// 客户端不存在的指纹。api-key 账号不在这个分支里，调用方可控的语义保持不变。
+		//
+		// 范围只到这条路：`ensureCodexIdentityHeaders` 仍然无条件 `Set` 回 `responses=experimental`，
+		// 但它的调用方是 /v1/messages 兼容桥、live 探测与插件目录 —— 都不是 HTTP /responses，
+		// 而前者本来就不是真 Codex 客户端形态。别把这行读成「全站不再发这个头」。
+		req.Header.Del("OpenAI-Beta")
 		if compatMessagesBridge {
-			req.Header.Del("OpenAI-Beta")
 			req.Header.Del("originator")
 		} else {
-			stripOpenAILegacyResponsesBeta(req.Header)
 			req.Header.Set("originator", resolveOpenAIUpstreamOriginator(c, isCodexCLI))
 		}
 		apiKeyID := getAPIKeyIDFromContext(c)
@@ -1868,6 +1991,8 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 			req.Header.Set("session_id", harvestSession)
 		} else if promptCacheKey != "" {
 			isolated := isolateOpenAIUpstreamSessionID(apiKeyID, codexAccountIdentitySource(c, account), promptCacheKey)
+			// 双开兼容桥的连字符会话头不在这里写：桥在入站侧合成了客户端原始身份（openai_compat_bridge_identity.go），
+			// session-id / thread-id 由收敛投影按入站头派生，这个下划线别名随后被它删掉——与真客户端请求同一条路。
 			req.Header.Set("session_id", isolated)
 			if !compatMessagesBridge || clientConversationID != "" {
 				req.Header.Set("conversation_id", isolated)
@@ -1895,7 +2020,10 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 	// 同一组 Codex IDs 发送给另一份 OAuth 凭据。可选指纹收敛随后仍可覆盖这些值。
 	if s.harvestPinnedSessionForModel(ctx, account, extractOpenAICodexTicketModel(body)) == "" {
 		applyCodexAccountIdentityHeaders(req.Header, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
+
+		// 指纹收敛：使用 Forward() 中预计算的收敛 ID 改写出站头，与请求体使用同一份 IDs。
 		applyStagedCodexFingerprintHeaders(c, account, req.Header)
+		applyCodexFingerprintConvergenceHeaders(c, codexAccountIdentitySource(c, account), req.Header)
 	}
 
 	// 终态收口：强制统一 OAuth 出站身份（User-Agent / originator / version 同源自洽）。
@@ -1922,12 +2050,18 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 	// 保证不被覆盖丢失）。
 	applyOpenAICodexBetaFeatures(c, account, req.Header)
 	setOpenAICodexRoutingHintFromBody(req.Header, account, body)
+	applyCodexDeviceWireProfile(c, account, req.Header, false)
+	alignCodexTurnMetadataExecutionHeader(c, account, wireTargetURL, req.Header, body)
 	logOpenAIRoutingDiagnosticsFromBody(ctx, account, "http", req.Header, body, "not_applicable")
 	s.pinBoundCodexTicketHarvestIdentity(req, account)
 
 	if err := applyMappedGPT55LiteCompatibility(req, account, body); err != nil {
 		return nil, err
 	}
+
+	// 侧信道：按真客户端节奏补一条只读 GET settings/user（openai_codex_side_calls.go）。
+	// 异步执行，读已定稿的身份头，不改本请求。
+	s.scheduleCodexSideCalls(c, account, req)
 	return req, nil
 }
 

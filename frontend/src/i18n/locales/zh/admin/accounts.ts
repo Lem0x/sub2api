@@ -1,6 +1,8 @@
 export default {
     accounts: {
       title: '账号管理',
+      upstreamRecordingTitle: '上游交互记录（不推荐启用）',
+      upstreamRecordingHint: '默认关闭，与网关池无关，仅记录此账号的 OpenAI/Codex 交互。会加密保存敏感对话正文及路由信息，增加资源与磁盘消耗；认证头不保存。只记录实际发送/读取的应用层数据，不额外读完已取消或主动关闭的响应。全实例默认 2 GiB，达到上限停止并在服务日志告警；没有日志浏览页面，需服务器管理员导出。',
       description: '管理 AI 平台账号和 Cookie',
       createAccount: '添加账号',
       autoRefresh: '自动刷新',
@@ -121,6 +123,7 @@ export default {
         todayStats: '整个统计',
         groups: '分组',
         usageWindows: '用量窗口',
+        gateway: '网关落点',
         proxy: '代理',
         lastUsed: '最近使用',
         createdAt: '创建时间',
@@ -133,7 +136,8 @@ export default {
         ungrouped: '未分组',
         hint: '显示格式为“分组名 / 基础分 / 粘性加分”。基础分按当前筛选条件限定的候选账号计算，包含优先级、负载、排队、错误率、首包延迟、重置窗口、额度余量、计费倍率等因子；粘性加分只在开启粘性加权时用于 previous_response_id 或 session_hash。分数越大越优先。'
       },
-      usageWindowsHint: '“5h / 7d”是上游账号（如 OpenAI ChatGPT、Claude）官方的滚动用量窗口限制，由上游对账号设定，并非 sub2api 配置，也与你映射的模型无关。窗口滚动到期后用量会自动重置，无法在 sub2api 端解除该限制。',
+      gatewayColumnHint: '展示当前路由票、满血使用统计与优质/普通候选队列。只有当前有效且已验满的票显示绿色，候选一律中性，不代表已经恢复满血。队列按同成员、同模型的后端证据分类，只读已有目录与本地冷却；无有效快照显示—，不为页面额外取票或探测。大区与网关名是池端交付口径，不等于已观测的上游实际落点。',
+      usageWindowsHint: '“5h / 7d”是上游账号（如 OpenAI ChatGPT、Claude）官方的滚动用量窗口限制，由上游对账号设定，并非 sub2api 配置，也与你映射的模型无关。窗口滚动到期后用量会自动重置，无法在 sub2api 端解除该限制。紫色/琥珀色的条目是该账号当前生效的 Codex Turn-State（按模型分），倒计时是这张票自铸造起 1 小时的剩余有效期；琥珀色代表这张票疑似降智。',
       ollamaCloud: {
         title: 'Ollama Cloud 用量',
         sessionSecurityHint: '浏览器会话会加密落库，且只发送到固定的 Ollama 官方设置页。',
@@ -319,8 +323,9 @@ export default {
           openaiNormal: 'OpenAI OAuth RPM 正常',
           tieredNormal: 'RPM 限制 (三区模型) - 正常',
           tieredWarning: 'RPM 限制 (三区模型) - 接近阈值',
-          tieredStickyOnly: 'RPM 限制 (三区模型) - 仅粘性会话 | 缓冲区: {buffer}',
-          tieredBlocked: 'RPM 限制 (三区模型) - 已阻塞 | 缓冲区: {buffer}',
+          // 裸 `|` 是 vue-i18n 的复数分隔符，不带计数的 t() 只渲染第一段；字面量用 {'|'}。
+          tieredStickyOnly: "RPM 限制 (三区模型) - 仅粘性会话 {'|'} 缓冲区: {buffer}",
+          tieredBlocked: "RPM 限制 (三区模型) - 已阻塞 {'|'} 缓冲区: {buffer}",
           stickyExemptNormal: 'RPM 限制 (粘性豁免) - 正常',
           stickyExemptWarning: 'RPM 限制 (粘性豁免) - 接近阈值',
           stickyExemptOver: 'RPM 限制 (粘性豁免) - 超限，仅粘性会话'
@@ -533,7 +538,9 @@ export default {
         creditsExhaustedUntil: 'AI Credits 已用尽，预计 {time} 恢复',
         overloadedUntil: '负载过重，重置时间：{time}',
         viewTempUnschedDetails: '查看临时不可调度详情',
-        tempUnschedulableUntil: '预计 {time} 恢复'
+        tempUnschedulableUntil: '预计 {time} 恢复',
+        turnStateHold: '降智暂停 · {model} 在本账号上停着，猎手寻票中；猎到即恢复，到期后有请求会再停',
+        turnStateHoldShort: '降智'
       },
       tempUnschedulable: {
         title: '临时不可调度',
@@ -561,6 +568,12 @@ export default {
         accountName: '账号',
         triggeredAt: '触发时间',
         until: '解除时间',
+        cooldownUntil: '本地冷却恢复时间',
+        cooldownRemaining: '本地冷却剩余',
+        cooldownUnknown: '无法估计',
+        cooldownFinished: '本地冷却已到期，等待状态同步',
+        cooldownEstimateHint: '按第 {count} 个本地冷却截止恢复；已知数量不足时等全部已知网关冷却结束。不复查池端库存，取票与满血验证仍照常执行。',
+        poolRestPending: '等待本地冷却到期后自动恢复；不再复查池端候选数量',
         remaining: '剩余时间',
         matchedKeyword: '匹配关键词',
         errorMessage: '错误详情',
@@ -755,6 +768,8 @@ export default {
       recoverStateSuccess: '账号状态已恢复',
       recoverStateFailed: '恢复账号状态失败',
       fallbackActive: '已回退',
+      cprOutbound: 'CPR 出口',
+      cprOutboundHint: '实际出口由 CPR 决定：{endpoint}。上面这个代理只作用于 sub2api → CPR 这一跳。',
       fallbackActiveTip: '原代理 {origin} 已到期，当前使用备用代理',
       revertProxy: '切回原代理',
       revertProxySuccess: '已成功切回原代理',
@@ -820,6 +835,66 @@ export default {
       },
       // OpenAI specific hints
       openai: {
+        gwpoolCredentialScope: '同一套上游凭据共享验票和账本；同一工作区的不同成员独立记账。本地实测和冷却规则优先，池端数据仅供参考。',
+        gatewayQueues: {
+          title: '候选队列',
+          quality: '优质队列',
+          ordinary: '普通队列',
+          qualityHint: '优质队列：同成员、同模型、实际静置层的可靠记录中满血多于降智；换票优先考虑，不保证冷却更快。',
+          ordinaryHint: '普通队列：低收益或证据不足的候选，保留有限探索机会，不永久排除。',
+          hint: '只读有效目录快照并排除本地冷却、当前或已退休票所在网关。数字为候选数，最多列出3个；不是已验满数量，也不保证下一张选择顺序。无有效快照显示—，不会为显示额外取票或探测。',
+          candidateHint: '{name} · 候选，尚未验满',
+          more: '另有 {count} 个候选',
+          empty: '暂无候选',
+          unknown: '暂无快照'
+        },
+        gatewayRuntime: {
+          durationHours: '{hours}小时{minutes}分{seconds}秒',
+          live: '已验证 · {gateway} · 验证模型：{models}',
+          unverified: '尚未验证',
+          counts: '本轮验满 / 尝试 {full} / {attempted} 张',
+          active: '当前周期满血使用 {duration}',
+          activeHint: '仅统计已验满票承载业务的活跃区间，并发去重；不含空闲、找票、验证和重试等待。旧口径时长不再展示。',
+          duration: '{minutes}分{seconds}秒',
+          history: '使用历史',
+          ended: '{full}/{attempted}张 · 满血使用 {duration} · {end}结束',
+          archived: '历史满血累计 {duration} / {count}轮',
+          archivedCounts: '历史记录 {count}轮',
+          legacy: '旧统计 · {model} · {full}/{attempted}张',
+          legacyArchived: '旧归档 · {model} · {count}轮 · {full}/{attempted}张',
+          durationIncomplete: '（部分时长未观测）',
+          incomplete: '（计数为下界）'
+        },
+        gatewayProgress: {
+          run: '验证 #{id}',
+          idle: '当前无验证请求',
+          pending: '待重新准备',
+          count: '已试{attempt}张 · 用时{seconds}秒',
+          lastCount: '上次试票 {attempt} / {limit} 张 · 用时{seconds}秒',
+          fetching: '正在获取候选票',
+          verifying: '正在验证候选票',
+          waiting: '等待候选 / 验证重试',
+          ready: '已验满 · 队列暂停验证',
+          recentReady: '最近验满',
+          exhausted: '验证已结束 · 未找到可用票',
+          unknown: '验证已结束 · 未完成（缺票、超时或异常）',
+          cancelled: '验证已结束 · 请求取消',
+          rejected: '{count}张未通过',
+          concurrent: '{count}个请求正在预检（含当前请求）',
+          unavailable: '实时验证进度暂不可用'
+        },
+        gwpoolResumeGateways: '恢复门槛',
+        gwpoolResumeGatewaysDesc: '候选耗尽后，等第N个本地冷却到期恢复，不复查池端库存；已知不足N则等全部结束，无记录则不休息。默认50。',
+        gwpoolCandidatesHint: '候选指可取且未冷却的网关，不代表已验满；清单读取失败不按零处理。',
+        gwpoolBulkHint: '逐项勾选才修改；未选字段保留各账号原值。数字清空恢复默认；Key留空保留原Key，不复制任一账号的运行统计。',
+        gwpoolBulkApply: '修改：{field}',
+        gwpoolContinuousWait: '缺票时持续等待',
+        gwpoolContinuousWaitDesc: '满血防护下，票失效后立即逐张取票验证，有候选就持续处理原请求，候选耗尽后按现有规则休息。此开关默认关闭；开启则耗尽后仍留号保活等待，不进入池休息。冷却、验满、鉴权及限流仍生效；客户端取消即退出，无请求不主动找票。',
+        gwpoolContinuousWaitInactiveLimits: '开启后，耗尽也不进入池休息，恢复数量设置暂不生效但保留原值。关闭后仍会试尽候选，耗尽才休息。客户端或中间代理的硬超时仍可能结束连接。',
+        gwpoolProbeTimeout: '票验证最大时间（秒）',
+        gwpoolProbeTimeoutDesc: '默认10秒，范围1–120秒。前置A/B和后置确认的每一发均使用此超时，整组预算按发数计算；超时属于未知故障，不计为降级。所有满血验证固定使用Luna，不改变业务模型。',
+        gwpoolPrepareRetries: '异常恢复次数',
+        gwpoolPrepareRetriesDesc: '默认0次，不额外重试。可配置发送业务前取票或验证异常的额外恢复次数；并发请求共享恢复，次数用完后失败票进入冷却，不重放业务。',
         baseUrlHint: '留空使用官方 OpenAI API',
         prismBrowser: '自动使用 Prism 浏览器协议',
         prismBrowserDesc: '使用此 OpenAI OAuth 账号接入服务器管理的 Prism 适配器，无需另填 Prism 凭据。支持以下四个模型的文本请求，以及 6.1 Sol 的客户端函数和自定义工具。',
@@ -878,6 +953,9 @@ export default {
         copilotSDKDesc: '保留 Codex 原生工具结构，断连时取消 SDK 回合。请使用仅含一个 sidecar 账号的独立分组；Base URL 和 API Key 填适配服务地址及密钥。',
         oauthPassthroughDesc:
           '开启后，该 OpenAI 账号将自动透传请求与响应，仅替换认证并保留计费/并发/审计及必要安全过滤；如遇兼容性问题可随时关闭回滚。',
+        rawRelay: '原样中继（klno）',
+        rawRelayDesc:
+          '开启后该账号只替换认证：请求按原始字节（含压缩）与全部请求头发出，响应状态码/头/正文原样返回；仅按分组策略改推理强度、渠道模型映射与 Fast。上游整体不可用才换号。适合下一跳是另一个 sub2api 的账号；账号级模型映射与自定义请求头不生效。',
         flattenNamespaces: '摊平 Codex namespace 工具（兼容）',
         flattenNamespacesDesc:
           '默认关闭：/responses 上的 namespace 工具声明原样转发，这正是 ChatGPT Codex 后端期望的形态。仅当该 OAuth 账号指向不认识 namespace 的兼容上游时才开启——摊平会把工具改名为 namespace__tool，使按 functions.<命名空间>.<工具> 寻址的模型（如 gpt-5.6 多智能体）无法调用。压缩（compact）请求不受该开关影响，始终摊平。',
@@ -941,6 +1019,8 @@ export default {
         codexCLIOnlyAppServerDesc: '仅在上方开关开启时生效。开启后本账号额外放行内嵌 Codex 引擎、经 app-server 协议接入的第三方客户端（如 Claude Code 的 codex 插件），仍需通过全局引擎指纹门；与全局 app-server 开关取 OR（任一开即放行）。',
         codexFingerprintMode: 'Codex 指纹收敛',
         codexFingerprintModeDesc: '多人共享同一 OAuth 账号时，将各用户的设备/会话标识收敛为账号级恒定值，减少上游可见的设备数和会话数。默认关闭（原样透传客户端标识），需要时再显式开启；部分账号开启收敛后出现过额度缩水，请按自己的实测结果选择。',
+        codexFingerprintConvergence: '实验性指纹收敛（klno）',
+        codexFingerprintConvergenceDesc: '让这把 API key 的出站身份在 HTTP / WS 上与真 Codex 客户端形态一致：补齐 session-id / thread-id 头，x-client-request-id 等于 thread-id，去掉 session_id / conversation_id 别名，root_turn_id 等与同类字段同源派生，保持 UUIDv7。关闭时与上游行为完全一致；开启那一刻该账号的会话标识会一次性轮换。',
         codexFingerprintOff: '关闭（透传，默认）',
         codexFingerprintDevice: '仅设备',
         codexFingerprintSession: '设备+会话',
@@ -953,6 +1033,11 @@ export default {
         codexTurnTicketMissing: '暂无有效门票，仍允许请求',
         codexTurnTicketReady: '剩余 {time}',
         codexTurnTicketPaused: '未打到 780，该模型已暂停',
+        codexUserAgent: 'Codex 出站 User-Agent',
+        codexUserAgentDesc: '该账号出站时自报的客户端标识，HTTP、WS 握手与额度查询共用。留空使用全局设置。'
+          + '要与该账号使用者的真实系统一致：UA 报 Windows、请求体里却是 Linux 路径和 shell，两者互相矛盾。'
+          + '版本号会被网关统一改写为生效版本，填什么都一样。',
+        codexUserAgentPlaceholder: '留空使用全局设置',
         codexImageTool: 'Codex 图片桥接策略',
         codexImageToolDesc:
           '统一控制 Codex /responses 文本请求的 hosted image_generation 桥接和客户端图片工具声明。hosted 工具自动注入仅适用于非 Responses Lite 请求；账号级策略优先于渠道和全局配置，不影响独立图片生成接口。',
@@ -968,6 +1053,174 @@ export default {
         codexImageToolBadgeEnabled: 'Hosted 桥接已开启',
         codexImageToolBadgeDisabled: '不注入 Hosted 工具',
         codexImageToolBadgeBlock: '客户端图片工具已移除',
+        gwpool: '使用网关池选择 Codex 路由',
+        gwpoolManualRetry: '清空冷却',
+        gwpoolManualRetryPending: '处理中…',
+        gwpoolManualRetryHint: '仅清除本地冷却、退避及网关池休息，保留活票和历史。不取票、不发验证请求，不清鉴权或上游限流；下次业务到来时再准备。',
+        gwpoolManualRetryFailed: '清除本地冷却失败',
+        gwpoolManualRetryResult: {
+          cleared: '本地冷却已清除，活票和历史已保留；未发起验证。'
+        },
+        gwpoolDesc:
+          '开启后，从网关池获取路由票，并在缓存有效期内复用。取不到可用票时，该账号请求失败，不回退到旧路由。原本使用 WebSocket 的上游请求会改走 HTTP/SSE。',
+        gwpoolBaseUrl: '网关池地址',
+        gwpoolBaseUrlDesc:
+          '填写根地址，例如 https://pool.0102400.xyz，不要填写 /a/xxxx 个人页面地址。',
+        gwpoolConsumerKey: '消费端凭据（Consumer Key）',
+        gwpoolConsumerKeyPlaceholder: '粘贴网关池提供的 Consumer Key',
+        gwpoolConsumerKeyKeep: '已保存，留空不修改',
+        gwpoolConsumerKeyDesc:
+          '用于向网关池取票，不是 ChatGPT 的访问令牌。保存后不回显；已保存时留空可保留原值。',
+        gwpoolAdvanced: '进阶：单次网络超时',
+        gwpoolGatewayWindow: '初始冷却时间（秒）',
+        gwpoolCooldownResetHours: '冷却退避重置（小时）',
+        gwpoolCooldownResetDesc: '默认24小时，0关闭。定期降回初始冷却档，不重置账号额度；保留最近触碰、历史和活票，不立即解除冷却。',
+        gwpoolGatewayWindowDesc:
+          '默认 3600 秒（1 小时），可设 1～24 小时。每个账号×网关独立学习并调整冷却；到期只表示允许重试，不保证恢复。',
+        gwpoolFetchTimeout: '单次取票超时（秒）',
+        gwpoolFetchTimeoutDesc:
+          '默认 10 秒。仅限制单次取票网络等待，不是整个候选验证过程的总时限。',
+        gwpoolListTimeout: '单次网关清单超时（秒）',
+        gwpoolListTimeoutDesc:
+          '默认 2 秒。限制获取候选网关清单的等待；失败或超时后交给池子选择，仍遵守本地冷却。',
+        gwpoolDetails: '查看冷却、触发条件与排障说明',
+        gwpoolCooldownDetails:
+          '冷却按成员凭据×网关分别计算。明确未恢复时依次退避到 1/2/4/6/8/10/12/16/20/24 小时；确认恢复后结束本周期。同一档位在两个独立周期成功后固定，再次失败会解除固定。网络错误不参与学习，池端建议不改变本地冷却。',
+        gwpoolGuardDetails:
+          '网关池始终严格验满；未知或验证超时阻止业务请求，不记降级。前台 A/B 和后置确认统一使用 Luna，业务模型不变。A/B 先取 state 再回带确认；业务需要复验时，票龄小于90秒额外最多3发，90秒及以上额外1发。任意 HTTP 200 且 state 同值或缺省即停止，保留原业务响应，全部刷新才丢票。验证不发送业务正文。错误、限流或超时为未知，不学习降级冷却。',
+        gwpoolWarmDetails:
+          '同身份共享候选队列，取票和单次验证各有网络超时。每条请求独立等票，退出不影响其他等待者；最后一个等待者退出才取消网络工作，队列进度保留。验证请求消耗上游配额，不计入业务计费。',
+        gwpoolErrors: {
+          GWPOOL_SETTING_INVALID: '网关池设置无效，请检查开关类型和数值范围。',
+          GWPOOL_TARGET_INVALID: '网关池批量设置仅支持OpenAI OAuth或Setup Token账号。',
+          GWPOOL_BASE_URL_INVALID:
+            '网关池地址必须是绝对的 http(s) 地址，例如 https://pool.0102400.xyz。填池子的根地址，不是 /a/xxxx 个人页面。',
+          GWPOOL_CONSUMER_KEY_REQUIRED:
+            '这个账号开着网关池，必须填消费端凭据（Consumer Key）：粘贴池子发给这个账号的那把 key。'
+        },
+        turnStateHunterEffort: '探测思考强度',
+        turnStateHunterUsageKey: '记账 API Key ID（留空不记）',
+        turnStateHunterUsageKeyDesc:
+          '填了就把每次 200 探测按标准用量路径记到这把 key 下（类型「猎手探测」，正常计费扣额度、刷新最近使用）；输入 token 为本地估算（含 base prompt），输出恒 0。建议用一把专用 key：它的额度/限流会被探测消耗，订阅型分组要有有效订阅才记。',
+        turnStateRecovery: '降智恢复探测',
+        turnStateRecoveryDesc:
+          '用账号自己的出口每隔一段不固定的时间出一道糖果题（正常模型答 21，降智答 29/36），最近「总次数」次里答对「成功次数」次就判定降智已恢复并打上标记；连续「总次数」次答错则进入冷却。独立于猎手（猎手关着也能开），只标记与记日志，不会自动改任何配置。判定后停止探测，真实流量再铸出 312 就清掉标记重新攒。',
+        turnStateRecoveryModel: '探测模型',
+        turnStateRecoveryModelAuto: '留空 = gpt-5.6-sol',
+        turnStateRecoveryStreak: '总次数（窗口）',
+        turnStateRecoverySuccess: '成功次数',
+        turnStateRecoveryEffortDefault: '默认（medium）',
+        turnStateRecoveryCooldown: '失败冷却（小时）',
+        turnStateRecoveryMin: '间隔下限（分钟）',
+        turnStateRecoveryMax: '间隔上限（分钟）',
+        gatewayHistory: {
+          diagnostics: '诊断',
+          runtimeSummary: '验证 {requests} · 待发 {pending}',
+          probeSource: { foreground: '前台验证', background: '后台准备' },
+          probeTotals: '{rounds} 轮 / {requests} 发：满血 {full}、降级 {degraded}、未知 {inconclusive}；平均 {seconds}s/轮，累计 {perFull} 发/成功轮',
+          feedbackTotals: '反馈：已发送 {sent}，待重试 {pending}，永久失败 {failed}，已丢弃 {discarded}',
+          runtimeHint: '仅累计验证请求尝试，不含业务请求；未知不算降级，不代表业务满血率或实际 token/金额。待发送最多 64 条，启用期间保留 7 天。',
+          empty: '网关 -',
+          current: '当前',
+          seen: '打过 {n} 个',
+          // tooltip 的五段是「区域-网关名-满血时间-状态-判定」，每段只放**值**不带标签：
+          // 运营方竖着扫一列看，每行重复一遍「窗口内打过，仍在冷却」会把真正要比的那几个
+          // 值推到行尾对不齐。长说法留在 gatewayColumnHint 和 legend 里，那两处只出现一次。
+          // 「冷却中」三个字不带信息量——一列全是它。换成还剩多少分钟出冷却（按本地账本
+          // 那个窗口算，默认 4 小时），竖着扫就能挑出最快能再用的那个。
+          regionHot: '剩余CD:{minutes}分钟',
+          regionCooled: '可重试',
+          regionIdle: '未打过',
+          // 第三段是满血**时长**（判成满血到判成降智那一段），直接渲染成 `180s`，没有 i18n 键。
+          // 这一条是没有时长读数时的占位：窗口还在跑、从没验出过满血、两条读数挤在同一次写入
+          // 里算不出长度——对读者是同一件事，合成一个标签。
+          fullUntimed: '未计时',
+          cooldownFixed: '固定{minutes}分钟',
+          cooldownRecommended: '池子建议{minutes}分钟',
+          legend: '✓ 当前票已验证 · ! 本地冷却中 · 灰 可再试；历史满血不代表当前可用',
+          // 两个数各报各的，**不做减法**：历史落点来自本地账本（过去一个窗口碰过的网关名），
+          // 池子剩余是「此刻可交付的清单」现对本地账本得出的，两个集合不是包含关系。
+          windowUsage: '冷却中 {used} · 冷却完毕 {cooled}',
+          poolSnapshot: '最近库存快照：{free}（非实时）',
+          windowUsageHint:
+            '「冷却中」和「冷却完毕」按本行历史中各网关的冷却截止时间实时计算；时间未知不计入完毕。' +
+            '冷却完毕只表示允许重试，不保证池中仍有票或已经恢复满血。',
+          // 冷却到期只是允许重试，不能把本地估计写成满血保底。
+          forecast: '可重试网关按实测成功率估计：一小时约 {minutes} 分钟满血',
+          forecastPending: '一小时满血预测：待统计（同层样本不足）',
+          forecastNone: '一小时内没有落点出冷却',
+          forecastHint:
+            '按 (账号 × 网关) 算，别按大区并：一小时内可重试 {units} 个。按最近验证模型 {model} / {source} / state-echo-v1，匹配实际静置间隔分档，以数量 × 实测满血率 × 已观测结束的平均满血时长计算，封顶60分钟。\n' +
+            '仅用本地最近7天内最多64轮重复接触；每档至少 {results} 次有结论和 {windows} 个结束窗口，无结论不算失败；缺样本不沿用183秒或固定成功率。未观测结束的窗口不参与时长，存在截尾偏差。同凭据其他行可能尚有未合并记录。\n' +
+            '这是估计，不是满血保底、票据有效期或配额；不保证仍有票，已有业务/预热仍需确认恢复。',
+          contactSummary: '接触 {count} 轮',
+          contactHint: '最多保留7天内64轮；下方显示最近8轮明细。按模型、判据、来源、首次分类和实际间隔分层；成功率分母不含无结论。首次仅指本地开始跟踪后首次，不代表上游从未接触。满血时长是已观测结束窗口的历史读数，不是票据有效期。',
+          contactTruncated: '历史不完整或曾被裁剪，缺失记录不能当成首次接触。',
+          contactRate: '满血 {full}/{total}；无结论 {unknown}；结束窗口 {windows} 个，平均 {seconds}s',
+          contactTimes: '首次记录 {first}；最近发送 {last}；本轮 {round}；实际间隔 {gap}s',
+          contactWindow: '本轮历史满血 {seconds}s；最近验证 {at} · {model} · {source} · {outcome}',
+          contactStep: '已发送 {sent} · HTTP {status} · 收到state {state} · echo接受 {echo} · 实测网关 {gateway} · {ms}ms（—为无证据）',
+          contactSources: { foreground: '前台预检', background: '后台预检', business: '业务' },
+          contactFirst: { tracked_first: '跟踪后首次', repeat: '重复接触', unknown: '首次未知' },
+          contactOutcomes: { full: '满血', refreshed: 'state刷新', unknown: '无结论' },
+          // state-echo 判定（后端 openai_gwpool_state_echo.go）。
+          verdicts: {
+            full: '满血',
+            fullExpired: '历史满血（不代表当前票或其它模型可用）',
+            degraded: '降智',
+            none: '没判过'
+          },
+          regions: {
+            'southeast-asia': '东南亚',
+            'africa': '非洲',
+            'north-america': '北美',
+            'south-america': '南美',
+            europe: '欧洲',
+            'east-asia': '东亚',
+            oceania: '大洋',
+            'south-asia': '南亚',
+            'middle-east': '中东',
+            unknown: '未归类'
+          }
+        },
+        turnStatePool: {
+          empty: 'Turn-State -',
+          starved: 'Turn-State 无票·裸奔中',
+          manualTag: '手填',
+          observedTag: '最近铸出',
+          summary: '{n} 个模型有生效的 Turn-State',
+          summaryObservedOnly: '无生效票，{n} 条仅为读数',
+          detail: '{model}：{shape} {health}，铸于 {minted}，到期 {expires}',
+          detailPair: '，pair {n} 个',
+          detailReminted: '，上游已重铸 {n} 次',
+          healthy: '满血',
+          degraded: '疑似降智',
+          unknown: '新形态·判不了',
+          hunterSummary: '猎手(实验性) 本小时 {count}/{max} · {next} · {last}',
+          hunterNext: '下次 {time}',
+          hunterReady: '待命',
+          hunterProbing: '探测中',
+          recoverySummary: '恢复探测 答对 {successes}/{window}（需 {success}） · {next}',
+          recoveryCooling: '冷却至 {time}',
+          recoveryDone: '降智已恢复 · {time}',
+          recoveryResultHit: '答 {answer}✓',
+          recoveryResultMiss: '答 {answer}✗',
+          recoveryDetail: "{time} {model} {'@'}{proxy}{exit}：{result}，耗时 {latency}",
+          hunterGateIdle: '无流量·暂停',
+          hunterGateHeld: '降智暂停·补票中',
+          hunterGateFresh: '票未到期',
+          hunterNeedsAuto: '猎手 未生效：需先开自动接管',
+          // `@` 是 vue-i18n 的链接消息前缀，裸写会在生产构建里抛 SyntaxError 并整块吞掉
+          // 账号列的 Turn-State 格子；字面量要用 {'@'}。
+          hunterLast: "上次 {result} {'@'}{proxy} {time}",
+          hunterLastNone: '尚未探测',
+          hunterResultHit: '{chars}✓',
+          hunterResultMiss: '{chars}',
+          hunterResultAnswerHit: '{chars}·答 {answer}✓',
+          hunterResultAnswerMiss: '{chars}·答 {answer}✗',
+          hunterResultError: '出错 {status} {error}',
+          hunterDetail: "{time} {model} {'@'}{proxy}{exit}：{result}，耗时 {latency}",
+        },
         compactMode: 'Compact 模式',
         compactModeDesc:
           '控制本账号在 /responses/compact 调度中的参与方式。Auto 跟随探测结果，Force On 强制允许，Force Off 强制排除。',
@@ -1098,7 +1351,8 @@ export default {
       poolModeRetryStatusCodesHint: '仅在池模式下生效。以英文逗号分隔的 HTTP 状态码（100-599），命中时触发同账号重试。留空使用默认值（{default}）。',
       customErrorCodes: '自定义错误码',
       customErrorCodesHint: '仅对选中的错误码停止调度',
-      customErrorCodesWarning: '仅选中的错误码会停止调度，其他错误将返回 500。',
+      customErrorCodesWarning:
+        '自定义错误码仅用于筛选常规的账号错误处理（如停止调度、限流标记），不决定请求是否重试或切换账号。未选中的错误仍可能触发重试或切换账号，最终返回给客户端的状态码取决于网关路径和错误透传规则，并非统一返回 500。列表为空时不做筛选。',
       customErrorCodes429Warning:
         '429 已有内置的限流处理机制。添加到自定义错误码后，将直接停止调度而非临时限流。确定要添加吗？',
       customErrorCodes529Warning:
@@ -1127,7 +1381,7 @@ export default {
         bulkDisableHint: '保存后将关闭所选账号的请求头覆写并清空已有配置。',
         bulkReplaceHint: '保存后将用下方配置整体替换所选账号已有的请求头覆写配置。',
         bulkEmptyRows: '请至少添加一行请求头再保存；如需清空已有配置，请关闭上方开关。',
-        invalidName: '请求头名称格式不正确（仅允许字母、数字和 !#$%&\'*+-.^_`|~ 字符）',
+        invalidName: "请求头名称格式不正确（仅允许字母、数字和 !#$%&'*+-.^_`{'|'}~ 字符）",
         blockedName: '该请求头不允许覆写（认证头与连接控制头由系统管理）',
         duplicateName: '存在重复的请求头名称（匹配不区分大小写）',
         invalidValue: '请求头值不合法（不允许控制字符，长度不超过 8192）',
@@ -1354,6 +1608,24 @@ export default {
         apiKeyHint: '上游服务的 API Key',
         pleaseEnterBaseUrl: '请输入上游 Base URL',
         pleaseEnterApiKey: '请输入上游 API Key'
+      },
+      // CPR（codex-proxy-rs）中继
+      cpr: {
+        typeHint: 'codex-proxy-rs 中继',
+        baseUrl: 'CPR 网关地址',
+        baseUrlHint: 'codex-proxy-rs 的监听地址，例如 http://127.0.0.1:18081。必填，且不会回落到官方端点。',
+        clientKey: 'CPR Client Key',
+        clientKeyHint: 'CPR 后台「客户端密钥」里创建的密钥。该密钥应只绑定一个分组，且分组内只有这一个 CPR 账号。',
+        accountId: 'CPR 账号 ID',
+        accountIdHint: 'CPR 后台里这个账号的 id（形如 acct_xxx），用于拉取额度。',
+        adminApiKey: 'CPR Admin API Key',
+        adminApiKeyHint: 'CPR 的管理 API Key（admin- 开头），仅用于读取额度与账号状态。',
+        adminBaseUrl: 'CPR Admin 地址（可选）',
+        adminBaseUrlHint: '留空则与网关地址相同。',
+        baseUrlRequired: '请输入 CPR 网关地址',
+        clientKeyRequired: '请输入 CPR Client Key',
+        accountIdRequired: '请输入 CPR 账号 ID',
+        adminApiKeyRequired: '请输入 CPR Admin API Key'
       },
       // OAuth flow
       oauth: {
